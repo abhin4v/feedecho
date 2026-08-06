@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — Feeds{% endblock %}
+{% block content %}
+<h1>Feeds</h1>
+
+<form method="post" action="/api/feeds" class="inline-form">
+    <input type="text" name="name" placeholder="Feed name" required>
+    <input type="url" name="url" placeholder="https://example.com/feed.xml" required>
+    <input type="number" name="poll_interval" value="15" min="1" max="1440" title="Poll interval (minutes)">
+    <button type="submit">Add Feed</button>
+</form>
+
+{% if feeds %}
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>URL</th>
+            <th>Interval</th>
+            <th>Last Fetched</th>
+            <th>Item ID Set</th>
+            <th>Echoes</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for feed in feeds %}
+        <tr>
+            <td>{{ feed.name }}</td>
+            <td><a href="{{ feed.url }}" target="_blank" rel="noopener"><small>{{ feed.url[:50] }}{% if feed.url|length > 50 %}…{% endif %}</small></a></td>
+            <td>{{ feed.poll_interval }} min</td>
+            <td><small>{{ feed.last_fetched or 'Never' }}</small></td>
+            <td>
+                {% if feed.last_item_id %}
+                <span class="badge badge-success">Yes</span>
+                {% else %}
+                <span class="badge badge-warning">No — click Init</span>
+                {% endif %}
+            </td>
+            <td>{{ feed_echoes[feed.id] }}</td>
+            <td class="action-cell">
+                <button class="btn-sm" onclick="testFeed({{ feed.id }})">Test</button>
+                <button class="btn-sm" onclick="initFeed({{ feed.id }})">Init</button>
+                <button class="btn-sm" onclick="fetchNow({{ feed.id }})">Fetch</button>
+                <form method="post" action="/api/feeds/{{ feed.id }}/delete" class="inline">
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this feed and all its echoes?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty-state">No feeds yet. Add one above to get started.</p>
+{% endif %}
+{% endblock %}

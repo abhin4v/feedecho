@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — Dashboard{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-value">{{ stats.accounts }}</span>
+        <span class="stat-label">Accounts</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-value">{{ stats.feeds }}</span>
+        <span class="stat-label">Feeds</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-value">{{ stats.active_echoes }}</span>
+        <span class="stat-label">Active Echoes</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-value">{{ stats.total_posts }}</span>
+        <span class="stat-label">Posts Sent</span>
+    </div>
+    {% if stats.failed_posts > 0 %}
+    <div class="stat-card stat-warning">
+        <span class="stat-value">{{ stats.failed_posts }}</span>
+        <span class="stat-label">Failed</span>
+    </div>
+    {% endif %}
+</div>
+
+<section>
+    <h2>Active Echoes</h2>
+    {% if echoes %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Feed</th>
+                <th>Account</th>
+                <th>Template</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for echo in echoes %}
+            <tr>
+                <td>{{ echo.feed_name }}</td>
+                <td>{{ echo.account_name }}<br><small>{{ echo.account_instance }}</small></td>
+                <td><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
+                <td>
+                    {% if echo.enabled %}
+                    <span class="badge badge-success">Enabled</span>
+                    {% else %}
+                    <span class="badge badge-muted">Disabled</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-state">No echoes yet. <a href="/echoes">Create one</a> to start cross-posting.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>Recent Posts</h2>
+    {% if recent_posts %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Feed</th>
+                <th>Account</th>
+                <th>Item</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for post in recent_posts %}
+            <tr>
+                <td><small>{{ post.posted_at }}</small></td>
+                <td>{{ post.feed_name }}</td>
+                <td>{{ post.account_name }}</td>
+                <td>{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</td>
+                <td>
+                    {% if post.status == 'success' %}
+                    <span class="badge badge-success">Success</span>
+                    {% else %}
+                    <span class="badge badge-danger">Failed</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-state">No posts yet. Once your echoes start running, posts will appear here.</p>
+    {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — Echoes{% endblock %}
+{% block content %}
+<h1>Echoes</h1>
+
+<p class="hint">An Echo routes items from a Feed to a Mastodon Account using a template.</p>
+
+<form method="post" action="/api/echoes" class="echo-form">
+    <div class="form-row">
+        <label>Feed
+            <select name="feed_id" required>
+                {% for feed in feeds %}
+                <option value="{{ feed.id }}">{{ feed.name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Account
+            <select name="account_id" required>
+                {% for account in accounts %}
+                <option value="{{ account.id }}">{{ account.name }} ({{ account.instance }})</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div class="form-row">
+        <label>Visibility
+            <select name="visibility">
+                <option value="public">Public</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="private">Private (followers only)</option>
+                <option value="direct">Direct</option>
+            </select>
+        </label>
+        <label>Enabled
+            <input type="checkbox" name="enabled" value="true" checked>
+        </label>
+    </div>
+    <div class="form-row">
+        <label>Template
+            <textarea name="template" rows="3" placeholder="{{ title }} {{ link }}">{{ '{{ title }} {{ link }}' }}</textarea>
+        </label>
+    </div>
+    <details class="template-vars">
+        <summary>Available template variables</summary>
+        <table class="vars-table">
+            {% for v in template_vars %}
+            <tr>
+                <td><code>{{ v.var }}</code></td>
+                <td>{{ v.desc }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </details>
+    <button type="submit">Create Echo</button>
+</form>
+
+{% if echoes %}
+<h2>Existing Echoes</h2>
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Feed</th>
+            <th>Account</th>
+            <th>Template</th>
+            <th>Visibility</th>
+            <th>Status</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for echo in echoes %}
+        <tr>
+            <td>{{ echo.feed_name }}</td>
+            <td>{{ echo.account_name }}</td>
+            <td><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
+            <td>{{ echo.visibility }}</td>
+            <td>
+                {% if echo.enabled %}
+                <span class="badge badge-success">Enabled</span>
+                {% else %}
+                <span class="badge badge-muted">Disabled</span>
+                {% endif %}
+            </td>
+            <td class="action-cell">
+                <button class="btn-sm" onclick="toggleEcho({{ echo.id }})">Toggle</button>
+                <form method="post" action="/api/echoes/{{ echo.id }}/delete" class="inline">
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this echo?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty-state">No echoes yet. Create one above.</p>
+{% endif %}
+{% endblock %}

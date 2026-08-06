@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}FeedEcho{% endblock %}</title>
+    <meta name="description" content="Self-hosted RSS feed cross-poster.">
+    <meta name="theme-color" content="#1a1a2e">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/css/style.css?v=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand">
+            <span class="nav-icon" aria-hidden="true">📡</span> FeedEcho
+        </a>
+        <div class="nav-links">
+            <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">Dashboard</a>
+            <a href="/feeds" class="{% if request.url.path == '/feeds' %}active{% endif %}">Feeds</a>
+            <a href="/accounts" class="{% if request.url.path == '/accounts' %}active{% endif %}">Accounts</a>
+            <a href="/echoes" class="{% if request.url.path == '/echoes' %}active{% endif %}">Echoes</a>
+            <a href="/history" class="{% if request.url.path == '/history' %}active{% endif %}">History</a>
+        </div>
+    </nav>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <script src="/static/js/app.js?v=1"></script>
+</body>
+</html>

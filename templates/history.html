@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — History{% endblock %}
+{% block content %}
+<h1>Post History</h1>
+
+{% if posts %}
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Feed</th>
+            <th>Account</th>
+            <th>Item</th>
+            <th>Status</th>
+            <th>Error</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for post in posts %}
+        <tr>
+            <td><small>{{ post.posted_at }}</small></td>
+            <td>{{ post.feed_name }}</td>
+            <td>{{ post.account_name }}<br><small>{{ post.instance }}</small></td>
+            <td>
+                {% if post.item_url %}
+                <a href="{{ post.item_url }}" target="_blank" rel="noopener">{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</a>
+                {% else %}
+                {{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}
+                {% endif %}
+            </td>
+            <td>
+                {% if post.status == 'success' %}
+                <span class="badge badge-success">Success</span>
+                {% else %}
+                <span class="badge badge-danger">Failed</span>
+                {% endif %}
+            </td>
+            <td><small>{{ post.error_message or '' }}</small></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty-state">No posts yet.</p>
+{% endif %}
+{% endblock %}

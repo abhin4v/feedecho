@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — Accounts{% endblock %}
+{% block content %}
+<h1>Mastodon Accounts</h1>
+
+<form method="post" action="/api/accounts" class="inline-form">
+    <input type="text" name="name" placeholder="Account name (e.g. Main)" required>
+    <input type="url" name="instance" placeholder="https://dmv.community" required>
+    <input type="password" name="access_token" placeholder="Access token" required>
+    <button type="submit">Add Account</button>
+</form>
+
+{% if accounts %}
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Instance</th>
+            <th>Token</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for account in accounts %}
+        <tr>
+            <td>{{ account.name }}</td>
+            <td>{{ account.instance }}</td>
+            <td><code>{{ '•' * 8 }}</code></td>
+            <td class="action-cell">
+                <button class="btn-sm" onclick="testAccount({{ account.id }})">Test Connection</button>
+                <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account and all its echoes?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty-state">No accounts yet. Add your Mastodon instance and access token above.</p>
+{% endif %}
+{% endblock %}
