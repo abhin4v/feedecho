@@ -34,6 +34,9 @@
         <label>Enabled
             <input type="checkbox" name="enabled" value="true" checked>
         </label>
+    </div>
+    <div class="form-row">
+        <label>Template
             <textarea name="template" rows="3" placeholder="{{ title }} {{ link }}">{{ '{{ title }} {{ link }}' }}</textarea>
         </label>
     </div>
@@ -53,6 +56,7 @@
 
 {% if echoes %}
 <h2>Existing Echoes</h2>
+<div class="data-table-wrapper">
 <table class="data-table">
     <thead>
         <tr>
@@ -67,18 +71,18 @@
     <tbody>
         {% for echo in echoes %}
         <tr>
-            <td>{{ echo.feed_name }}</td>
-            <td>{{ echo.account_name }}</td>
-            <td><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
-            <td>{{ echo.visibility }}</td>
-            <td>
+            <td data-label="Feed">{{ echo.feed_name }}</td>
+            <td data-label="Account">{{ echo.account_name }}</td>
+            <td data-label="Template"><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
+            <td data-label="Visibility">{{ echo.visibility }}</td>
+            <td data-label="Status">
                 {% if echo.enabled %}
                 <span class="badge badge-success">Enabled</span>
                 {% else %}
                 <span class="badge badge-muted">Disabled</span>
                 {% endif %}
             </td>
-            <td class="action-cell">
+            <td data-label="Actions" class="action-cell">
                 <button class="btn-sm" onclick="toggleEcho({{ echo.id }})">Toggle</button>
                 <form method="post" action="/api/echoes/{{ echo.id }}/delete" class="inline">
                     <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this echo?')">Delete</button>
@@ -88,6 +92,7 @@
         {% endfor %}
     </tbody>
 </table>
+</div>
 {% else %}
 <p class="empty-state">No echoes yet. Create one above.</p>
 {% endif %}

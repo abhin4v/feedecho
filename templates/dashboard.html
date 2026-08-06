@@ -31,6 +31,7 @@
 <section>
     <h2>Active Echoes</h2>
     {% if echoes %}
+    <div class="data-table-wrapper">
     <table class="data-table">
         <thead>
             <tr>
@@ -43,10 +44,10 @@
         <tbody>
             {% for echo in echoes %}
             <tr>
-                <td>{{ echo.feed_name }}</td>
-                <td>{{ echo.account_name }}<br><small>{{ echo.account_instance }}</small></td>
-                <td><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
-                <td>
+                <td data-label="Feed">{{ echo.feed_name }}</td>
+                <td data-label="Account">{{ echo.account_name }}<br><small>{{ echo.account_instance }}</small></td>
+                <td data-label="Template"><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
+                <td data-label="Status">
                     {% if echo.enabled %}
                     <span class="badge badge-success">Enabled</span>
                     {% else %}
@@ -57,6 +58,7 @@
             {% endfor %}
         </tbody>
     </table>
+    </div>
     {% else %}
     <p class="empty-state">No echoes yet. <a href="/echoes">Create one</a> to start cross-posting.</p>
     {% endif %}
@@ -65,6 +67,7 @@
 <section>
     <h2>Recent Posts</h2>
     {% if recent_posts %}
+    <div class="data-table-wrapper">
     <table class="data-table">
         <thead>
             <tr>
@@ -78,11 +81,11 @@
         <tbody>
             {% for post in recent_posts %}
             <tr>
-                <td><small>{{ post.posted_at }}</small></td>
-                <td>{{ post.feed_name }}</td>
-                <td>{{ post.account_name }}</td>
-                <td>{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</td>
-                <td>
+                <td data-label="Time"><small>{{ post.posted_at }}</small></td>
+                <td data-label="Feed">{{ post.feed_name }}</td>
+                <td data-label="Account">{{ post.account_name }}</td>
+                <td data-label="Item">{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</td>
+                <td data-label="Status">
                     {% if post.status == 'success' %}
                     <span class="badge badge-success">Success</span>
                     {% else %}
@@ -93,6 +96,7 @@
             {% endfor %}
         </tbody>
     </table>
+    </div>
     {% else %}
     <p class="empty-state">No posts yet. Once your echoes start running, posts will appear here.</p>
     {% endif %}

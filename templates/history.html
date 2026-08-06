@@ -4,6 +4,7 @@
 <h1>Post History</h1>
 
 {% if posts %}
+<div class="data-table-wrapper">
 <table class="data-table">
     <thead>
         <tr>
@@ -18,28 +19,29 @@
     <tbody>
         {% for post in posts %}
         <tr>
-            <td><small>{{ post.posted_at }}</small></td>
-            <td>{{ post.feed_name }}</td>
-            <td>{{ post.account_name }}<br><small>{{ post.instance }}</small></td>
-            <td>
+            <td data-label="Time"><small>{{ post.posted_at }}</small></td>
+            <td data-label="Feed">{{ post.feed_name }}</td>
+            <td data-label="Account">{{ post.account_name }}<br><small>{{ post.instance }}</small></td>
+            <td data-label="Item">
                 {% if post.item_url %}
                 <a href="{{ post.item_url }}" target="_blank" rel="noopener">{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</a>
                 {% else %}
                 {{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}
                 {% endif %}
             </td>
-            <td>
+            <td data-label="Status">
                 {% if post.status == 'success' %}
                 <span class="badge badge-success">Success</span>
                 {% else %}
                 <span class="badge badge-danger">Failed</span>
                 {% endif %}
             </td>
-            <td><small>{{ post.error_message or '' }}</small></td>
+            <td data-label="Error"><small>{{ post.error_message or '' }}</small></td>
         </tr>
         {% endfor %}
     </tbody>
 </table>
+</div>
 {% else %}
 <p class="empty-state">No posts yet.</p>
 {% endif %}

@@ -34,6 +34,7 @@
 
 {% if accounts %}
 <h2>Connected Accounts</h2>
+<div class="data-table-wrapper">
 <table class="data-table">
     <thead>
         <tr>
@@ -46,10 +47,10 @@
     <tbody>
         {% for account in accounts %}
         <tr>
-            <td>{{ account.name }}</td>
-            <td>{{ account.instance }}</td>
-            <td><small>{{ account.created_at }}</small></td>
-            <td class="action-cell">
+            <td data-label="Name">{{ account.name }}</td>
+            <td data-label="Instance">{{ account.instance }}</td>
+            <td data-label="Added"><small>{{ account.created_at }}</small></td>
+            <td data-label="Actions" class="action-cell">
                 <button class="btn-sm" onclick="testAccount({{ account.id }})">Test Connection</button>
                 <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
                     <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account and all its echoes?')">Delete</button>
@@ -59,6 +60,7 @@
         {% endfor %}
     </tbody>
 </table>
+</div>
 {% else %}
 <p class="empty-state">No accounts yet. Connect your Mastodon instance above to get started.</p>
 {% endif %}
