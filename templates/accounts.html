@@ -3,20 +3,43 @@
 {% block content %}
 <h1>Mastodon Accounts</h1>
 
-<form method="post" action="/api/accounts" class="inline-form">
-    <input type="text" name="name" placeholder="Account name (e.g. Main)" required>
-    <input type="url" name="instance" placeholder="https://dmv.community" required>
-    <input type="password" name="access_token" placeholder="Access token" required>
-    <button type="submit">Add Account</button>
-</form>
+{% if error %}
+<div class="alert alert-error">{{ error }}</div>
+{% endif %}
+
+{% if request.query_params.get('status') == 'connected' %}
+<div class="alert alert-success">Account connected successfully.</div>
+{% endif %}
+
+<section class="oauth-section">
+    <h2>Connect via OAuth</h2>
+    <p class="hint">Enter your Mastodon instance to connect your account with a single click. No need to manually create access tokens.</p>
+    <form method="get" action="/oauth/connect" class="inline-form">
+        <input type="text" name="instance" placeholder="https://dmv.community" required>
+        <button type="submit">Connect Account</button>
+    </form>
+</section>
+
+<section class="manual-section">
+    <details>
+        <summary>Or add manually with a token</summary>
+        <form method="post" action="/api/accounts" class="inline-form" style="margin-top: 0.75rem;">
+            <input type="text" name="name" placeholder="Account name (e.g. Main)" required>
+            <input type="url" name="instance" placeholder="https://dmv.community" required>
+            <input type="password" name="access_token" placeholder="Access token" required>
+            <button type="submit">Add Account</button>
+        </form>
+    </details>
+</section>
 
 {% if accounts %}
+<h2>Connected Accounts</h2>
 <table class="data-table">
     <thead>
         <tr>
             <th>Name</th>
             <th>Instance</th>
-            <th>Token</th>
+            <th>Added</th>
             <th>Actions</th>
         </tr>
     </thead>
@@ -25,7 +48,7 @@
         <tr>
             <td>{{ account.name }}</td>
             <td>{{ account.instance }}</td>
-            <td><code>{{ '•' * 8 }}</code></td>
+            <td><small>{{ account.created_at }}</small></td>
             <td class="action-cell">
                 <button class="btn-sm" onclick="testAccount({{ account.id }})">Test Connection</button>
                 <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
@@ -37,6 +60,6 @@
     </tbody>
 </table>
 {% else %}
-<p class="empty-state">No accounts yet. Add your Mastodon instance and access token above.</p>
+<p class="empty-state">No accounts yet. Connect your Mastodon instance above to get started.</p>
 {% endif %}
 {% endblock %}

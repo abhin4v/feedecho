@@ -17,9 +17,10 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from database import get_db, init_db
 from feed_parser import fetch_feed
-from mastodon import test_connection, post_status
+from mastodon import test_connection, post_status, verify_credentials
 from template_engine import render_template, available_variables
 from scheduler import start_scheduler, stop_scheduler, check_feed
+from oauth import get_authorize_url, exchange_code, parse_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
@@ -338,6 +339,80 @@ async def preview_template(
         return {"success": True, "rendered": rendered, "item_title": item["title"]}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ── API: OAuth ───────────────────────────────────────────────────────────────
+
+@app.get("/oauth/connect")
+async def oauth_connect(request: Request, instance: str = ""):
+    """Redirect to Mastodon OAuth authorize page."""
+    if not instance:
+        raise HTTPException(status_code=400, detail="Instance URL is required")
+    instance = validate_url(instance)
+    try:
+        auth_url = get_authorize_url(instance, "")
+        return RedirectResponse(url=auth_url)
+    except Exception as e:
+        logger.error(f"OAuth connect failed for {instance}: {e}")
+        return render("accounts.html", request,
+                      accounts=_get_accounts(),
+                      error=f"Failed to connect to {instance}: {e}")
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Handle the OAuth callback from Mastodon."""
+    if error:
+        return render("accounts.html", request,
+                      accounts=_get_accounts(),
+                      error=f"Authorization denied: {error}")
+
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state parameter")
+
+    try:
+        _, instance = parse_state(state)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    try:
+        token_data = exchange_code(instance, code)
+    except Exception as e:
+        logger.error(f"OAuth token exchange failed: {e}")
+        return render("accounts.html", request,
+                      accounts=_get_accounts(),
+                      error=f"Token exchange failed: {e}")
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return render("accounts.html", request,
+                      accounts=_get_accounts(),
+                      error="No access token in response")
+
+    # Verify credentials to get the account name
+    try:
+        creds = verify_credentials(instance, access_token)
+        name = creds.get("display_name") or creds.get("username", "Unknown")
+        username = creds.get("username", "unknown")
+    except Exception:
+        name = "Unknown"
+        username = "unknown"
+
+    with get_db() as db:
+        # Use INSERT OR REPLACE so re-authenticating an existing instance updates the token
+        db.execute(
+            """INSERT OR REPLACE INTO accounts (name, instance, access_token)
+               VALUES (?, ?, ?)""",
+            (f"{name} ({username})", instance, access_token),
+        )
+
+    return RedirectResponse(url="/accounts?status=connected", status_code=303)
+
+
+def _get_accounts():
+    """Helper to fetch accounts without tokens."""
+    with get_db() as db:
+        return db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
 
 
 # ── Misc ─────────────────────────────────────────────────────────────────────

@@ -259,3 +259,27 @@ code {
 }
 
 .inline { display: inline; }
+
+/* Alerts */
+.alert {
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+}
+.alert-success { background: rgba(61,139,94,0.15); border: 1px solid rgba(61,139,94,0.4); color: #5dba7e; }
+.alert-error { background: rgba(196,69,69,0.15); border: 1px solid rgba(196,69,69,0.4); color: #e87878; }
+
+/* OAuth section */
+.oauth-section, .manual-section {
+    margin-bottom: 1.5rem;
+}
+.oauth-section h2, .manual-section summary {
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+}
+.manual-section summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 0.5rem 0;
+}

@@ -67,6 +67,15 @@ def init_db():
             )
         """)
         db.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_apps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance TEXT NOT NULL UNIQUE,
+                client_id TEXT NOT NULL,
+                client_secret TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.execute("""
             CREATE INDEX IF NOT EXISTS idx_posted_items_echo
             ON posted_items(echo_id, posted_at DESC)
         """)
