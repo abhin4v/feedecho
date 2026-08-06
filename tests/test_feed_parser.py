@@ -1,7 +1,7 @@
 """Tests for the feed parser state tracking and item parsing."""
 
 import pytest
-from feed_parser import get_new_items, clean_text, clean_html
+from feed_parser import get_new_items, clean_text, strip_html, truncate
 
 
 class TestGetNewItems:
@@ -23,11 +23,12 @@ class TestGetNewItems:
         new = get_new_items(items, "2")
         assert new == []
 
-    def test_last_seen_not_in_feed(self):
-        """If last_seen_id is not in feed, all items are new."""
-        items = [{"id": "3"}, {"id": "2"}, {"id": "1"}]
+    def test_last_seen_not_in_feed_returns_newest_only(self):
+        """If cursor scrolled off feed, only post newest item to prevent spam."""
+        items = [{"id": "5"}, {"id": "4"}, {"id": "3"}, {"id": "2"}, {"id": "1"}]
         new = get_new_items(items, "old_id")
-        assert len(new) == 3
+        assert len(new) == 1
+        assert new[0]["id"] == "5"
 
     def test_empty_items(self):
         assert get_new_items([], "last") == []
@@ -63,26 +64,52 @@ class TestCleanText:
     def test_plain_text_unchanged(self):
         assert clean_text("Just text") == "Just text"
 
+    def test_decodes_entities(self):
+        assert clean_text("Tom &amp; Jerry") == "Tom & Jerry"
 
-class TestCleanHtml:
+    def test_decodes_numeric_entities(self):
+        assert clean_text("&#8217;") == "\u2019"
+
+
+class TestStripHtml:
     def test_strips_scripts(self):
         html = "<p>Hello</p><script>alert('xss')</script><p>World</p>"
-        result = clean_html(html)
+        result = strip_html(html)
         assert "alert" not in result
         assert "Hello" in result
         assert "World" in result
 
     def test_strips_styles(self):
         html = "<style>body { color: red; }</style><p>Content</p>"
-        result = clean_html(html)
+        result = strip_html(html)
         assert "color" not in result
         assert "Content" in result
 
     def test_empty_string(self):
-        assert clean_html("") == ""
+        assert strip_html("") == ""
 
-    def test_preserves_content(self):
+    def test_strips_all_tags(self):
         html = "<p>Hello <a href='link'>world</a></p>"
-        result = clean_html(html)
+        result = strip_html(html)
         assert "Hello" in result
         assert "world" in result
+        assert "<" not in result
+
+    def test_decodes_entities(self):
+        assert strip_html("&lt;b&gt;text&lt;/b&gt;") == "<b>text</b>"
+
+
+class TestTruncate:
+    def test_short_text_unchanged(self):
+        assert truncate("short text") == "short text"
+
+    def test_truncates_long_text(self):
+        long_text = "x" * 600
+        result = truncate(long_text, 500)
+        assert len(result) == 500
+        assert result.endswith("…")
+
+    def test_custom_max_len(self):
+        result = truncate("hello world", 5)
+        assert len(result) == 5
+        assert result.endswith("…")

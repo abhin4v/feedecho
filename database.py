@@ -49,7 +49,8 @@ def init_db():
                 enabled INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                UNIQUE(feed_id, account_id)
             )
         """)
         db.execute("""

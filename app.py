@@ -5,6 +5,7 @@ accounts, echoes, and viewing post history.
 """
 
 import os
+import re
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -39,16 +40,26 @@ def render(name: str, request: Request, status_code: int = 200, **kwargs) -> HTM
     return HTMLResponse(template.render(request=request, **kwargs), status_code=status_code)
 
 
-@app.on_event("startup")
-def on_startup():
+def validate_url(url: str) -> str:
+    """Validate a URL has http or https scheme."""
+    if not re.match(r"^https?://", url):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    return url.rstrip("/")
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
     start_scheduler()
     logger.info("FeedEcho started")
-
-
-@app.on_event("shutdown")
-def on_shutdown():
+    yield
     stop_scheduler()
+
+
+app.router.lifespan_context = lifespan
 
 
 # ── Pages ───────────────────────────────────────────────────────────────────
@@ -56,7 +67,7 @@ def on_shutdown():
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     with get_db() as db:
-        accounts = db.execute("SELECT * FROM accounts ORDER BY name").fetchall()
+        accounts = db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
         echoes = db.execute("""
             SELECT e.*, f.name as feed_name, f.url as feed_url,
@@ -102,7 +113,8 @@ async def feeds_page(request: Request):
 @app.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request):
     with get_db() as db:
-        accounts = db.execute("SELECT * FROM accounts ORDER BY name").fetchall()
+        # Don't select access_token — mask it in the UI
+        accounts = db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
     return render("accounts.html", request, accounts=accounts)
 
 
@@ -117,7 +129,7 @@ async def echoes_page(request: Request):
             ORDER BY e.created_at DESC
         """).fetchall()
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
-        accounts = db.execute("SELECT * FROM accounts ORDER BY name").fetchall()
+        accounts = db.execute("SELECT id, name, instance FROM accounts ORDER BY name").fetchall()
     return render("echoes.html", request, echoes=echoes, feeds=feeds, accounts=accounts,
                   template_vars=available_variables())
 
@@ -137,6 +149,11 @@ async def history_page(request: Request):
     return render("history.html", request, posts=posts)
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 # ── API: Accounts ───────────────────────────────────────────────────────────
 
 @app.post("/api/accounts")
@@ -145,7 +162,7 @@ async def add_account(
     instance: str = Form(...),
     access_token: str = Form(...),
 ):
-    instance = instance.rstrip("/")
+    instance = validate_url(instance)
     with get_db() as db:
         db.execute(
             "INSERT INTO accounts (name, instance, access_token) VALUES (?, ?, ?)",
@@ -179,6 +196,8 @@ async def add_feed(
     url: str = Form(...),
     poll_interval: int = Form(15),
 ):
+    url = validate_url(url)
+    poll_interval = max(1, min(poll_interval, 1440))
     with get_db() as db:
         db.execute(
             "INSERT INTO feeds (name, url, poll_interval) VALUES (?, ?, ?)",
@@ -244,18 +263,25 @@ async def fetch_now(feed_id: int):
 
 # ── API: Echoes ─────────────────────────────────────────────────────────────
 
+VALID_VISIBILITY = {"public", "unlisted", "private", "direct"}
+
+
 @app.post("/api/echoes")
 async def add_echo(
     feed_id: int = Form(...),
     account_id: int = Form(...),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
-    enabled: bool = Form(True),
+    enabled: str = Form(""),
 ):
+    if visibility not in VALID_VISIBILITY:
+        raise HTTPException(status_code=400, detail=f"Invalid visibility. Must be one of: {VALID_VISIBILITY}")
+    # HTML checkboxes: absent = unchecked, present = checked
+    is_enabled = 1 if enabled else 0
     with get_db() as db:
         db.execute(
             "INSERT INTO echoes (feed_id, account_id, template, visibility, enabled) VALUES (?, ?, ?, ?, ?)",
-            (feed_id, account_id, template, visibility, 1 if enabled else 0),
+            (feed_id, account_id, template, visibility, is_enabled),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 
@@ -284,6 +310,9 @@ async def update_echo_template(
     template: str = Form(...),
 ):
     with get_db() as db:
+        echo = db.execute("SELECT id FROM echoes WHERE id = ?", (echo_id,)).fetchone()
+        if not echo:
+            raise HTTPException(status_code=404, detail="Echo not found")
         db.execute("UPDATE echoes SET template = ? WHERE id = ?", (template, echo_id))
     return RedirectResponse(url="/echoes", status_code=303)
 
@@ -330,4 +359,5 @@ async def favicon():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8453)
+    # Bind to localhost — use a reverse proxy for remote access
+    uvicorn.run(app, host="127.0.0.1", port=8453)
