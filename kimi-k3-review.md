@@ -1,79 +1,122 @@
-# FeedEcho Code Review — Kimi K3 via OpenRouter
+# FeedEcho Code Review
 
-## Critical Bugs
+Overall: clean structure, parameterized SQL throughout (no injection issues found), and good instincts on idempotency and first-run backlog suppression. The findings below are ordered roughly by severity within each category.
 
-**1. `enabled` checkbox can never disable an echo** — `app.py:246` / `templates/echoes.html:32`
-An unchecked HTML checkbox is omitted from form data entirely. With `enabled: bool = Form(True)`, FastAPI falls back to the default `True` whether the box is checked or unchecked (verified with TestClient). There is no way to create a disabled echo. Use `enabled: Optional[bool] = Form(None)` and map `None -> 0`, or a hidden field pattern.
+---
 
-**2. `feedparser.parse_date` does not exist — date parsing is silently broken** — `feed_parser.py:140`
-`feedparser` has no `parse_date` attribute (raises `AttributeError`, verified). The `except Exception` swallows it, so RSS `pubDate` strings like `"Mon, 04 Aug 2025 12:00:00 GMT"` pass through unparsed. Consequences:
-- `{{ date:iso }}` and `{{ date:short }}` emit the raw RFC-822 string (verified in `template_engine._format_date`, which fails `fromisoformat` and falls back to the raw string).
-- Any feed-side date logic gets garbage. Use `email.utils.parsedate_to_datetime` or `dateutil.parser`, and don't blanket-swallow.
+## 1. Bugs and Edge Cases
 
-**3. JSON Feed metadata read from the wrong level** — `feed_parser.py:104-105`
-Per jsonfeed.org, `title` and `feed_url` are top-level keys. The code reads `data.get("feed", {})`, so every parsed JSON feed reports title `"Unknown"` (verified). Should be `data.get("title", ...)` / `data.get("feed_url", ...)`.
+### Critical
 
-**4. `get_new_items` — missed posts and edge cases** — `feed_parser.py:112-130`
-- `found_seen` is set but never used. If `last_seen_id` is not in the feed at all (rotated out, or the feed rewrote GUIDs), **every item in the feed is posted** — a spam burst. On not-found you should cap the backlog or require manual re-init.
-- No dedupe *within* the fetched batch (feeds with duplicate GUIDs).
-- No cap on `len(new_items)`. Combined with the not-found case, one bad fetch can fire dozens of Mastodon posts.
-- `scheduler.py:95` assumes `items[0]` is newest. True for most feeds, not guaranteed; safer to track by date once #2 is fixed.
+**`feedparser.parse_date` does not exist (`feed_parser.py:parse_date`).** Every call raises `AttributeError`, which is swallowed by the bare `except Exception`, so date parsing silently never works and raw strings pass through. Worse, you're re-parsing strings when feedparser already did the work: use `entry.get("published_parsed") or entry.get("updated_parsed")` (a `time.struct_time`) and convert with `datetime.fromtimestamp(time.mktime(t), tz=timezone.utc)`. This fixes RFC-822 RSS dates, ISO Atom dates, and removes the dependency on string parsing entirely.
 
-**5. No character-limit enforcement** — `scheduler.py:108-124`
-`{{ content }}` can render arbitrarily long (verified: a 10k-char item renders 10k chars). Mastodon rejects >500 chars (instance-configurable). The post then fails with an opaque error logged to `posted_items`. Truncate per-account or at least warn/validate at render time.
+**JSON Feed parsing doesn't follow the spec (`feed_parser.py:parse_json_feed`).** `data.get("feed", {})` — JSON Feed has no top-level `feed` key, so every JSON feed's title is "Unknown". Use `data.get("title", ...)`. Also:
+- `entry.get("author", {}).get("name", "")` crashes with `AttributeError` when `author` is explicitly `null` (valid JSON). Use `(entry.get("author") or {})`.
+- JSON Feed 1.1 uses `authors: [{name, url}]` (array); `author` is 1.0-only. Handle both.
 
-## Security
+**First-run feeds never post (`scheduler.py:check_feed`).** When `last_item_id` is NULL, `get_new_items` returns `[]`, and the "no new items" branch updates only `last_fetched` — `last_item_id` stays NULL forever. The feed will silently never post unless the user manually hits `/api/feeds/{id}/init`. Auto-initialize instead:
 
-**6. SSRF — unvalidated feed URLs and instance URLs** — `app.py:196-202`, `mastodon.py`
-`POST /api/feeds` and `POST /api/accounts` accept any URL with zero validation. The server then fetches it (feed polling, `test_connection`). This is a self-hosted single-user app, so the blast radius is your own network — but it can hit `http://169.254.169.254/`, internal services, etc. At minimum: require `http(s)` scheme, resolve the host and reject private/loopback/link-local ranges. Given it's self-hosted and auth-free (below), anyone who can reach the port can use your box as a proxy scanner.
+```python
+if last_seen_id is None:
+    db.execute("UPDATE feeds SET last_item_id = ?, last_fetched = ? WHERE id = ?",
+               (items[0]["id"], now_iso(), feed_id))
+    return
+```
 
-**7. No authentication on anything** — all of `app.py`
-Every route, including account deletion and token-bearing test endpoints, is wide open. If this binds `0.0.0.0` (it does, `app.py:330`) and is reachable by anyone else, they own your Mastodon accounts. Fine on localhost; needs at least a shared-secret header or basic auth before any network exposure.
+**`found_seen` is set but never used (`feed_parser.py:get_new_items`).** If `last_seen_id` has scrolled out of the feed (or IDs changed), *every* item is treated as new and posted. The per-echo idempotency check partially masks this for existing echoes, but a newly created echo on such a feed will spam the entire backlog to Mastodon. Fix: when `found_seen` is False, cap posts (e.g., newest item only, or newest N=3) and log a warning.
 
-**8. Access tokens at rest and in logs**
-- Plaintext in SQLite (`database.py:25`). Standard for this class of app, but the DB file should at least be `0600` and the threat model documented. Fernet-encrypt with a key from env if you want to do better.
-- `mastodon.py:60` puts up to 200 chars of the API error response into `test_connection`'s return, and `scheduler.py:128` stores `str(e)` into `error_message`, which is rendered in history views. Mastodon errors usually don't echo the token, but httpx exception messages can include the full request URL in some paths. Low risk; worth a note.
+**`poll_interval` is dead config (`scheduler.py`).** The column exists, the UI accepts it, but `check_all_feeds` checks every feed every 5 minutes regardless. Either enforce it (`WHERE last_fetched IS NULL OR last_fetched <= datetime('now', '-' || poll_interval || ' minutes')`) or remove the field — as-is it's a false promise.
 
-**9. XSS — mostly safe, one gap to verify**
-Jinja autoescape is on for `.html` (`app.py:31`) and feed content goes through `clean_text`/`clean_html` before rendering into posts. `clean_html` (feed_parser.py:132-137) strips only `script`/`style` — it leaves `onerror=`, `javascript:` URLs, `<img>` etc. intact. That HTML lands in `posted_items.item_title`/`item_url` and is rendered — but escaped by Jinja, so UI XSS is OK. The real risk is posting attacker-controlled HTML *to Mastodon* via `{{ content }}` — harmless (Mastodon sanitizes), but strips nothing before burning the 500-char budget on markup. Consider running `{{ content }}` through `clean_text` by default.
+**Failed posts are permanently skipped.** Two compounding problems in `scheduler.py`:
+1. The idempotency check matches rows with `status='failed'`, so a failed post is never retried.
+2. `last_item_id` advances to `items[0]` even if every post failed, so the items are never seen as "new" again.
 
-**10. CSRF on all state-changing POSTs** — `app.py`
-All mutations are plain form POSTs with no CSRF token and no `SameSite` cookie model (there are no cookies at all). Combined with #7, any web page you visit while the app is reachable can create echoes pointing your feeds at their Mastodon account, or delete everything.
+Result: a transient Mastodon outage means silent, permanent post loss. Filter the idempotency check to `status='success'`, and either add a retry pass over failed rows or only advance the cursor past successfully processed items.
 
-## Error handling gaps
+**Non-atomic external side effects inside one DB transaction.** `check_feed` holds a single transaction across feed fetch + all Mastodon posts. If the process dies mid-loop (or any unexpected exception escapes), the transaction rolls back — posts already made to Mastodon have no DB record, and the next poll reposts them (duplicates). Commit per item: advance `last_item_id` after each item is processed, and write `posted_items` rows in their own transactions. This also fixes the next issue.
 
-**11. Startup crash if `static/` is missing** — `app.py:26`. `StaticFiles(directory=...)` raises at import time if the dir doesn't exist. Minor, but the app won't boot on a partial checkout.
+### High
 
-**12. Scheduler exceptions only logged, never surfaced** — `scheduler.py:140-145`. A feed that fails every poll is invisible in the UI until the user reads logs. `feeds.last_fetched` stays stale — surface "last error" per feed in the UI.
+**Write lock held during network I/O.** That same long transaction blocks web UI writes for the duration of up to 30s of fetching plus N sequential Mastodon posts. With WAL, readers are fine, but writers will hit `database is locked` after SQLite's default 5s timeout. Fetch first, then write; keep transactions to pure DB work. Also set `sqlite3.connect(..., timeout=30)` / `PRAGMA busy_timeout` as a safety net.
 
-**13. `posted_items` grows unboundedly** — `database.py:47-60`. No retention policy. Add a periodic purge (e.g. keep 90 days or N rows per echo).
+**`{{ content }}` posts raw HTML to Mastodon (`template_engine.py` + `feed_parser.py:clean_html`).** `clean_html` strips only script/style; Mastodon's `status` field is plain text, so users get literal `<p>` tags in their timeline. For Mastodon output, HTML should be *stripped* (with entity decoding — `html.unescape`), not sanitized-for-display. Also: no 500-character truncation, so long-content posts fail with 422.
 
-**14. No uniqueness constraint** — `database.py`. Duplicate `(instance, access_token)` accounts and duplicate `(feed_id, account_id)` echoes are allowed, causing double-posts. The idempotency check in `scheduler.py:101` is per-echo, so two echoes with the same pair post twice. Add `UNIQUE(feed_id, account_id)` on echoes.
+**Items with empty IDs break dedup entirely.** `id` falls back to `entry.get("link", "")`; feeds without guid/link produce `id=""` for all items. Since `"" == ""`, the first item matches `last_seen_id` and *nothing ever posts*. Synthesize an ID: `hashlib.sha256((title + link + date).encode()).hexdigest()[:16]` when none exists.
 
-**15. Per-feed `poll_interval` is collected but ignored** — `database.py:35`, `scheduler.py:143-146`. The UI stores it, but `check_all_feeds` runs every 5 min and checks *every* feed regardless. Either schedule one job per feed keyed by `poll_interval` (and reschedule on edit), or compare `last_fetched + poll_interval <= now` in `check_all_feeds`.
+### Medium
 
-## Architecture
+- **Newest-first ordering assumed everywhere.** `get_new_items` and `items[0]` as "newest" break on oldest-first feeds (they exist). If dates are available, sort by date descending before processing.
+- **Checkbox bug:** `enabled: bool = Form(True)` means an unchecked HTML checkbox (field absent) defaults to `True` — you cannot create a disabled echo via a normal form.
+- **Duplicate echoes double-post.** No `UNIQUE(feed_id, account_id)` constraint; two identical echo rows post the same item twice to the same account (idempotency is per `echo_id`).
+- **Timestamps in two formats:** DB defaults write `CURRENT_TIMESTAMP` (`YYYY-MM-DD HH:MM:SS`), code writes `isoformat()` with `+00:00`. Pick one (ISO-8601 UTC) or sorting/comparison bugs will creep in.
+- **`clean_text` regex** doesn't decode entities (`&amp;` shows in titles) and breaks on `>` inside attributes. feedparser already sanitizes titles reasonably; at minimum add `html.unescape`.
+- Import-time `init_db()` in `database.py` runs on any import (including tests) and again at startup — move to startup only.
 
-- **Single global 5-min job with sequential fetches** — one slow feed (30s timeout) delays all others; 20 feeds × 30s worst case = 10 min inside a 5-min interval. APScheduler's default thread pool will overlap runs, and then two concurrent `check_feed` calls for the same feed can double-post (the idempotency check + `log_post` is not transactional across the two connections). Use `max_instances=1` and a lock per feed, plus `UNIQUE(echo_id, item_id)` on `posted_items` as a hard backstop.
-- **Blocking I/O in async route handlers** — every route is `async def` doing synchronous sqlite3 + httpx calls. Under any concurrency this stalls the event loop. Either make routes `def` (FastAPI runs them in a threadpool) or move to `async` sqlite/httpx.
-- **Per-request `PRAGMA journal_mode=WAL`** (`database.py:14`) — journal mode is persistent on the DB file; setting it per-connection is wasted work on every call.
-- `@app.on_event` is deprecated in current FastAPI — use lifespan handlers.
+---
 
-## Missing MVP features
+## 2. Security
 
-1. **Edit feed/account** — delete-and-recreate is the only path, and it cascades away echo history.
-2. **Per-feed error visibility + "backfill N items" option** (the init flow is there, but no "post last 3" for new echoes).
-3. **Retry with backoff for failed posts** — a transient Mastodon 502 is a permanent `failed` row.
-4. **Content-length truncation with ellipsis** (see #5) and per-instance max char lookup (`GET /api/v1/instance`).
-5. **Duplicate-feed detection by URL** on add.
-6. **Conditional GET** (`ETag`/`If-Modified-Since`) — polite and cuts parse work; `last_fetched` is stored but never sent.
+**No authentication — the biggest issue.** The app binds `0.0.0.0:8453` with zero auth. Anyone who reaches the port can delete all your data, add their own feeds, and — critically — *post arbitrary content through your stored Mastodon tokens* by creating an echo pointing at a feed they control. For a self-hosted app, minimum viable options: a single bearer token / basic auth from an env var, or bind to localhost with documented reverse-proxy auth. This must be addressed before the MVP is usable.
 
-## Priority order
+**SSRF with an exfiltration channel.** `add_feed` accepts any URL, `fetch_feed` follows redirects, and `/api/feeds/{id}/test` *returns parsed content to the caller*. Point it at `http://169.254.169.254/latest/meta-data/` or an internal service and read the response via the test endpoint. Fixes:
+- Validate scheme is `http`/`https` at input time.
+- Optionally block RFC-1918/loopback/link-local resolution (with an env-var escape hatch, since self-hosters legitimately follow internal feeds).
+- Enforce a response size cap (stream the body, abort at ~10 MB) — currently a hostile "feed" can OOM the process, and it also bounds decompression-bomb and parser-DoS risk.
 
-1. Fix the enabled checkbox (#1) and date parsing (#2) — both verified broken today.
-2. Bound `get_new_items` on not-found (#4) — the spam-burst case is the most damaging runtime behavior.
-3. Unique constraints on echoes and `posted_items(echo_id, item_id)` (#14) + scheduler concurrency guard.
-4. Truncation (#5), auth story (#7/#10) before any non-localhost exposure, SSRF allowlist (#6).
-5. Honor `poll_interval` (#15) or remove the field.
+**Drive-by CSRF works even without app auth.** If a user runs this on localhost, any website they visit can POST forms to `http://localhost:8453/api/feeds` (adding SSRF feeds, deleting accounts). SameSite cookies don't help since there's no session; a simple check (e.g., require a custom header via fetch, or verify `Origin`/`Host`) closes this.
 
-The bones are good — parameterized SQL everywhere, idempotency intent, clean module split. The bugs above are all small fixes; #1, #2, #3 I verified by running the code, so they're certain, not speculative.
+**Access tokens in plaintext, overexposed.** `access_token` is stored unencrypted and `SELECT * FROM accounts` passes the full row — token included — into Jinja templates on the accounts page and dashboard. Mask it in UI queries (`SELECT id, name, instance, ...`), and consider Fernet encryption with a key from env (or at minimum: document the threat model and `chmod 600` the DB). Also note `test_connection` echoes `e.response.text[:200]` to the UI — instance error pages can leak internal details.
+
+**XSS risk via preview/history.** Autoescape is on (good — assuming templates don't use `|safe`), but `{{ content }}` and the `/api/preview` response carry feed-controlled HTML. If the frontend injects preview output via `innerHTML`, that's reflected XSS from any feed you follow. Ensure the UI uses `textContent` for all rendered output, and replace regex-based `clean_html` with a real sanitizer (`nh3`/`bleach`) if HTML is ever displayed.
+
+**SQL injection: clean.** All queries parameterized, `ORDER BY` clauses are static. Keep it that way if you add sorting later.
+
+---
+
+## 3. Error Handling Gaps
+
+- **No retry/backoff for failing feeds or posts.** A dead feed costs a 30s timeout every cycle, serialized with all other feeds — enough dead feeds and `check_all_feeds` overruns its own interval. Track `consecutive_failures` per feed, back off exponentially, and surface the last error on the dashboard.
+- **No Mastodon rate-limit handling.** 429s (with `Retry-After`) and 5xx should be retried; Mastodon also supports an `Idempotency-Key` header — send a hash of `echo_id + item_id` to make retries safe.
+- **No input validation:** feed URL and instance URL aren't validated at creation (a scheme-less `instance` fails only later, at post time); `visibility` accepts arbitrary strings (Mastodon 422s on bad values); `poll_interval` accepts 0/negatives.
+- **Broad `except Exception`** in scheduler and API routes discards error taxonomy — distinguish fetch errors (retryable) from parse errors (feed is broken) from auth errors (token revoked; disable echo and notify).
+- No global 500 handler; unhandled route exceptions (e.g., `database is locked`) dump FastAPI's default error.
+- `update_echo_template` and the delete endpoints silently succeed on nonexistent IDs.
+- The scheduler's first run is 5 minutes after startup with no feedback; run `check_all_feeds` once at startup (or at least on feed creation).
+
+---
+
+## 4. Architecture Improvements
+
+1. **Per-feed APScheduler jobs** (or a thread pool in `check_all_feeds`) instead of one serial loop — respects `poll_interval`, isolates failures, and parallelizes I/O.
+2. **Separate fetch from write.** Restructure `check_feed`: fetch + parse (no DB held) → open short transaction → idempotency check + insert + cursor advance per item → close. This solves lock contention, atomicity, and retry semantics in one move.
+3. **Type the feed item.** A `@dataclass`/`pydantic.BaseModel` `FeedItem` instead of dicts threaded through parser → template → scheduler would have caught several of the `.get()` fragility issues above at definition time.
+4. **Config via `pydantic-settings`:** host/port, auth token, DB path, user agent, max feed size, worker guard — instead of scattered env reads and hardcoded values.
+5. **Modernize FastAPI lifecycle:** `@app.on_event` is deprecated → use `lifespan`. Also note the scheduler breaks under `uvicorn --workers N` (N duplicate schedulers → duplicate posts; the check-then-post race makes the idempotency check insufficient). Document single-worker requirement or add a file-lock guard.
+6. **Schema migrations:** use `PRAGMA user_version` + migration steps now, while the schema is small, and add the missing constraints (`UNIQUE(feed_id, account_id)`, `UNIQUE(posted_items.echo_id, posted_items.item_id)` as a hard backstop).
+7. **Shared `httpx.Client`** at module level with configured limits/timeouts rather than per-call clients.
+8. **Tests** — the highest-value targets: `get_new_items` state transitions (missing cursor, scrolled-off cursor, empty IDs), parser fixtures for RSS/Atom/JSON, template rendering, and scheduler behavior with `respx`-mocked HTTP.
+
+---
+
+## 5. Missing for MVP
+
+- **Authentication** (see Security — non-negotiable).
+- **Retry/manual repost** for failed items (the history page shows failures with no recourse).
+- **Post-length handling:** truncate with ellipsis, and optionally query the instance's `max_toot_chars` from `/api/v2/instance`.
+- **Conditional GET** (ETag/Last-Modified per feed) — bandwidth and politeness; feedparser makes this easy.
+- **Feed health surfacing:** last error + consecutive failure count on the feeds page; auto-disable after N failures.
+- **`/healthz`** for Docker/uptime monitoring.
+- **Token masking** in the accounts UI.
+- **Content Warning support** (Mastodon `spoiler_text`) — cross-posters without CW support are a common source of moderation complaints.
+- **Per-echo filters** (include/exclude keywords) — the most-requested cross-poster feature after basics work.
+- **Deployment artifacts:** Dockerfile/compose example and README guidance on binding, reverse proxy, and token security.
+
+---
+
+### Top 5 fixes if you do nothing else
+
+1. Add authentication (or bind localhost-only) — currently anyone can post through your accounts.
+2. Fix `feedparser.parse_date` (use `*_parsed` struct_time fields) and the JSON Feed `feed` key.
+3. Auto-initialize `last_item_id` on first successful fetch — feeds currently never post without manual init.
+4. Handle `found_seen=False` and make failed posts retryable — the two silent data-loss/spam paths in state tracking.
+5. Restructure `check_feed` so network I/O happens outside DB transactions with per-item commits.
