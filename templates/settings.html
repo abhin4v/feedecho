@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}FeedEcho — Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+<section>
+    <h2>SMTP Configuration</h2>
+    <p class="hint">Configure the SMTP server used to send email echoes. Required if you want to route feed items to email addresses.</p>
+
+    {% if smtp_configured %}
+    <div class="alert alert-success">SMTP is configured ({{ smtp_settings.smtp_host }}:{{ smtp_settings.smtp_port }}).</div>
+    {% else %}
+    <div class="alert alert-error" style="border-color: var(--warning); color: var(--warning); background: rgba(199,156,58,0.15);">SMTP not configured. Email echoes will fail until this is set up.</div>
+    {% endif %}
+
+    <form method="post" action="/api/settings/smtp" class="echo-form">
+        <div class="form-row">
+            <label>SMTP Host
+                <input type="text" name="smtp_host" value="{{ smtp_settings.smtp_host or '' }}" placeholder="smtp.fastmail.com" required>
+            </label>
+            <label>Port
+                <input type="number" name="smtp_port" value="{{ smtp_settings.smtp_port or '587' }}" min="1" max="65535" required>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>Username
+                <input type="text" name="smtp_username" value="{{ smtp_settings.smtp_username or '' }}" placeholder="user@example.com" required>
+            </label>
+            <label>Password
+                <input type="password" name="smtp_password" value="{{ smtp_settings.smtp_password or '' }}" placeholder="App password">
+            </label>
+        </div>
+        <div class="form-row">
+            <label>From Email
+                <input type="email" name="smtp_from_email" value="{{ smtp_settings.smtp_from_email or '' }}" placeholder="feedecho@example.com">
+            </label>
+            <label>From Name
+                <input type="text" name="smtp_from_name" value="{{ smtp_settings.smtp_from_name or 'FeedEcho' }}" placeholder="FeedEcho">
+            </label>
+        </div>
+        <div class="form-row">
+            <label>Use TLS
+                <select name="smtp_use_tls">
+                    <option value="1" {{ 'selected' if smtp_settings.smtp_use_tls != '0' else '' }}>STARTTLS (port 587)</option>
+                    <option value="0" {{ 'selected' if smtp_settings.smtp_use_tls == '0' else '' }}>SSL/TLS (port 465)</option>
+                </select>
+            </label>
+        </div>
+        <button type="submit">Save SMTP Settings</button>
+    </form>
+
+    <form method="post" action="/api/settings/smtp/test" class="inline-form" style="margin-top: 0.5rem;">
+        <input type="email" name="test_email" placeholder="email@example.com (optional, defaults to from address)">
+        <button type="submit" class="btn-sm">Send Test Email</button>
+    </form>
+</section>
+{% endblock %}

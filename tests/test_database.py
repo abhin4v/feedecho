@@ -57,10 +57,29 @@ class TestEchoes:
                 ("Test", "https://example.com", "token"),
             )
             db.execute(
-                "INSERT INTO echoes (feed_id, account_id, template) VALUES (?, ?, ?)",
-                (1, 1, "{{ title }}"),
+                "INSERT INTO echoes (feed_id, destination_type, destination_id, template) VALUES (?, ?, ?, ?)",
+                (1, "mastodon", 1, "{{ title }}"),
             )
             # Delete feed should cascade-delete echo
             db.execute("DELETE FROM feeds WHERE id = 1")
             echoes = db.execute("SELECT * FROM echoes").fetchall()
             assert len(echoes) == 0
+
+    def test_email_account_crud(self, temp_db):
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO email_accounts (name, email) VALUES (?, ?)",
+                ("Jason", "jason@example.com"),
+            )
+            rows = db.execute("SELECT * FROM email_accounts").fetchall()
+            assert len(rows) == 1
+            assert rows[0]["email"] == "jason@example.com"
+
+    def test_settings_crud(self, temp_db):
+        with get_db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("smtp_host", "smtp.example.com"),
+            )
+            row = db.execute("SELECT value FROM settings WHERE key = 'smtp_host'").fetchone()
+            assert row["value"] == "smtp.example.com"

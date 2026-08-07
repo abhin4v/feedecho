@@ -1,19 +1,23 @@
 {% extends "base.html" %}
 {% block title %}FeedEcho — Accounts{% endblock %}
 {% block content %}
-<h1>Mastodon Accounts</h1>
+<h1>Accounts</h1>
 
 {% if error %}
 <div class="alert alert-error">{{ error }}</div>
 {% endif %}
 
 {% if request.query_params.get('status') == 'connected' %}
-<div class="alert alert-success">Account connected successfully.</div>
+<div class="alert alert-success">Mastodon account connected successfully.</div>
+{% endif %}
+
+{% if request.query_params.get('status') == 'email_added' %}
+<div class="alert alert-success">Email address added.</div>
 {% endif %}
 
 <section class="oauth-section">
-    <h2>Connect via OAuth</h2>
-    <p class="hint">Enter your Mastodon instance to connect your account with a single click. No need to manually create access tokens.</p>
+    <h2>Connect Mastodon via OAuth</h2>
+    <p class="hint">Enter your Mastodon instance to connect with a single click.</p>
     <form method="get" action="/oauth/connect" class="inline-form">
         <input type="text" name="instance" placeholder="https://dmv.community" required>
         <button type="submit">Connect Account</button>
@@ -22,9 +26,9 @@
 
 <section class="manual-section">
     <details>
-        <summary>Or add manually with a token</summary>
+        <summary>Or add Mastodon manually with a token</summary>
         <form method="post" action="/api/accounts" class="inline-form" style="margin-top: 0.75rem;">
-            <input type="text" name="name" placeholder="Account name (e.g. Main)" required>
+            <input type="text" name="name" placeholder="Account name" required>
             <input type="url" name="instance" placeholder="https://dmv.community" required>
             <input type="password" name="access_token" placeholder="Access token" required>
             <button type="submit">Add Account</button>
@@ -32,8 +36,18 @@
     </details>
 </section>
 
-{% if accounts %}
-<h2>Connected Accounts</h2>
+<section>
+    <h2>Add Email Address</h2>
+    <p class="hint">Route feed items to an email inbox instead of (or in addition to) Mastodon. <a href="/settings">Configure SMTP first.</a></p>
+    <form method="post" action="/api/email-accounts" class="inline-form">
+        <input type="text" name="name" placeholder="Name (e.g. Jason)" required>
+        <input type="email" name="email" placeholder="jason@example.com" required>
+        <button type="submit">Add Email Address</button>
+    </form>
+</section>
+
+{% if mastodon_accounts %}
+<h2>Mastodon Accounts</h2>
 <div class="data-table-wrapper">
 <table class="data-table">
     <thead>
@@ -45,15 +59,15 @@
         </tr>
     </thead>
     <tbody>
-        {% for account in accounts %}
+        {% for account in mastodon_accounts %}
         <tr>
             <td data-label="Name">{{ account.name }}</td>
             <td data-label="Instance">{{ account.instance }}</td>
             <td data-label="Added"><small>{{ account.created_at }}</small></td>
             <td data-label="Actions" class="action-cell">
-                <button class="btn-sm" onclick="testAccount({{ account.id }})">Test Connection</button>
+                <button class="btn-sm" onclick="testAccount({{ account.id }})">Test</button>
                 <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
-                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account and all its echoes?')">Delete</button>
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account?')">Delete</button>
                 </form>
             </td>
         </tr>
@@ -61,7 +75,39 @@
     </tbody>
 </table>
 </div>
-{% else %}
-<p class="empty-state">No accounts yet. Connect your Mastodon instance above to get started.</p>
+{% endif %}
+
+{% if email_accounts %}
+<h2>Email Addresses</h2>
+<div class="data-table-wrapper">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Email</th>
+            <th>Added</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for account in email_accounts %}
+        <tr>
+            <td data-label="Name">{{ account.name }}</td>
+            <td data-label="Email">{{ account.email }}</td>
+            <td data-label="Added"><small>{{ account.created_at }}</small></td>
+            <td data-label="Actions" class="action-cell">
+                <form method="post" action="/api/email-accounts/{{ account.id }}/delete" class="inline">
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this email address?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</div>
+{% endif %}
+
+{% if not mastodon_accounts and not email_accounts %}
+<p class="empty-state">No accounts yet. Connect a Mastodon instance or add an email address above.</p>
 {% endif %}
 {% endblock %}

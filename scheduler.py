@@ -1,7 +1,8 @@
 """Scheduler — background feed checker that polls feeds and posts new items.
 
 Uses APScheduler for periodic feed checking. For each feed, fetches new items,
-finds matching echoes, renders templates, and posts to Mastodon.
+finds matching echoes, renders templates, and dispatches to the destination
+(Mastodon or email).
 
 Key design: network I/O happens OUTSIDE DB transactions. Each item is processed
 in its own short transaction to prevent lock contention and data loss.
@@ -15,6 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from database import get_db
 from feed_parser import fetch_feed, get_new_items, truncate
 from mastodon import post_status
+from email_sender import send_email
 from template_engine import render_template
 
 logger = logging.getLogger("feedecho.scheduler")
@@ -26,8 +28,9 @@ MASTODON_MAX_CHARS = 500
 def check_feed(feed_id: int):
     """Fetch a feed, find new items, post to all enabled echoes for that feed.
 
-    Network I/O (feed fetch + Mastodon posts) happens outside DB transactions.
-    Each item gets its own short transaction for cursor advance + post logging.
+    Network I/O (feed fetch + Mastodon posts / emails) happens outside DB
+    transactions. Each item gets its own short transaction for cursor advance
+    + post logging.
     """
     # 1. Read feed config (short transaction)
     with get_db() as db:
@@ -96,38 +99,56 @@ def check_feed(feed_id: int):
 
 
 def process_echo(echo, item: dict):
-    """Render template and post to Mastodon for a single echo/item pair.
+    """Render template and dispatch to the destination for a single echo/item pair.
 
-    Uses per-item transactions. Only advances cursor and logs after processing.
+    Supports Mastodon and email destinations. Uses per-item transactions.
     """
-    # Read account (short transaction)
+    # Check if already posted successfully (short transaction)
     with get_db() as db:
-        account = db.execute(
-            "SELECT * FROM accounts WHERE id = ?", (echo["account_id"],)
-        ).fetchone()
-        # Check if already posted successfully (idempotency — only success counts)
         already_posted = db.execute(
             "SELECT id FROM posted_items WHERE echo_id = ? AND item_id = ? AND status = 'success'",
             (echo["id"], item["id"]),
         ).fetchone()
 
-    if not account:
-        logger.error(f"Echo {echo['id']}: account {echo['account_id']} not found")
-        return
     if already_posted:
         logger.info(f"Echo {echo['id']}: item {item['id']} already posted successfully, skipping")
         return
 
     # Render template (no DB)
     content = render_template(echo["template"], item)
-    content = truncate(content, MASTODON_MAX_CHARS)
 
     if not content.strip():
         logger.warning(f"Echo {echo['id']}: rendered content is empty, skipping")
         _log_post(echo["id"], item, "failed", "Rendered content was empty")
         return
 
-    # Post to Mastodon (network I/O, no DB lock)
+    # Dispatch based on destination type
+    dest_type = echo["destination_type"]
+    dest_id = echo["destination_id"]
+
+    if dest_type == "mastodon":
+        _send_mastodon(echo, item, content, dest_id)
+    elif dest_type == "email":
+        _send_email_echo(echo, item, content, dest_id)
+    else:
+        logger.error(f"Echo {echo['id']}: unknown destination type '{dest_type}'")
+        _log_post(echo["id"], item, "failed", f"Unknown destination type: {dest_type}")
+
+
+def _send_mastodon(echo, item: dict, content: str, account_id: int):
+    """Post to Mastodon."""
+    with get_db() as db:
+        account = db.execute(
+            "SELECT * FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+
+    if not account:
+        logger.error(f"Echo {echo['id']}: account {account_id} not found")
+        _log_post(echo["id"], item, "failed", f"Account {account_id} not found")
+        return
+
+    content = truncate(content, MASTODON_MAX_CHARS)
+
     try:
         result = post_status(
             instance=account["instance"],
@@ -139,7 +160,35 @@ def process_echo(echo, item: dict):
         logger.info(f"Echo {echo['id']}: posted '{item['title'][:50]}' to {account['instance']}")
     except Exception as e:
         _log_post(echo["id"], item, "failed", str(e))
-        logger.error(f"Echo {echo['id']}: post failed: {e}")
+        logger.error(f"Echo {echo['id']}: Mastodon post failed: {e}")
+
+
+def _send_email_echo(echo, item: dict, content: str, email_account_id: int):
+    """Send an email with the rendered template content."""
+    with get_db() as db:
+        email_account = db.execute(
+            "SELECT * FROM email_accounts WHERE id = ?", (email_account_id,)
+        ).fetchone()
+
+    if not email_account:
+        logger.error(f"Echo {echo['id']}: email account {email_account_id} not found")
+        _log_post(echo["id"], item, "failed", f"Email account {email_account_id} not found")
+        return
+
+    subject = item.get("title", "FeedEcho: New Post")
+    subject = truncate(subject, 200)
+
+    try:
+        send_email(
+            to_email=email_account["email"],
+            subject=subject,
+            body=content,
+        )
+        _log_post(echo["id"], item, "success", None)
+        logger.info(f"Echo {echo['id']}: emailed '{item['title'][:50]}' to {email_account['email']}")
+    except Exception as e:
+        _log_post(echo["id"], item, "failed", str(e))
+        logger.error(f"Echo {echo['id']}: email failed: {e}")
 
 
 def _log_post(echo_id: int, item: dict, status: str, error: str | None = None):
@@ -163,9 +212,7 @@ def _update_last_fetched(feed_id: int):
 
 def check_all_feeds():
     """Check all feeds that are due based on their poll_interval."""
-    now = datetime.now(timezone.utc).isoformat()
     with get_db() as db:
-        # Respect per-feed poll_interval
         feeds = db.execute("""
             SELECT id, name FROM feeds
             WHERE last_fetched IS NULL
@@ -195,7 +242,6 @@ def start_scheduler():
     )
     scheduler.start()
     logger.info("Scheduler started — checking feeds every 2 minutes")
-    # Run once at startup
     scheduler.add_job(check_all_feeds, 'date', id='startup_check')
 
 

@@ -39,18 +39,36 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migrate old echoes schema if needed
+        cols = db.execute("PRAGMA table_info(echoes)").fetchall()
+        col_names = [c["name"] for c in cols]
+        if col_names and "account_id" in col_names and "destination_type" not in col_names:
+            db.execute("DROP TABLE echoes")
         db.execute("""
             CREATE TABLE IF NOT EXISTS echoes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 feed_id INTEGER NOT NULL,
-                account_id INTEGER NOT NULL,
+                destination_type TEXT NOT NULL DEFAULT 'mastodon',
+                destination_id INTEGER NOT NULL,
                 template TEXT NOT NULL DEFAULT '{{ title }} {{ link }}',
                 visibility TEXT DEFAULT 'public',
                 enabled INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                UNIQUE(feed_id, account_id)
+                FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS email_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
         db.execute("""

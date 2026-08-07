@@ -36,7 +36,7 @@
         <thead>
             <tr>
                 <th>Feed</th>
-                <th>Account</th>
+                <th>Destination</th>
                 <th>Template</th>
                 <th>Status</th>
             </tr>
@@ -45,7 +45,7 @@
             {% for echo in echoes %}
             <tr>
                 <td data-label="Feed">{{ echo.feed_name }}</td>
-                <td data-label="Account">{{ echo.account_name }}<br><small>{{ echo.account_instance }}</small></td>
+                <td data-label="Destination">{{ echo.destination_name or 'Unknown' }}</td>
                 <td data-label="Template"><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
                 <td data-label="Status">
                     {% if echo.enabled %}
@@ -83,7 +83,7 @@
             <tr>
                 <td data-label="Time"><small>{{ post.posted_at }}</small></td>
                 <td data-label="Feed">{{ post.feed_name }}</td>
-                <td data-label="Account">{{ post.account_name }}</td>
+                <td data-label="Account">{{ post.account_name or '' }}</td>
                 <td data-label="Item">{{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}</td>
                 <td data-label="Status">
                     {% if post.status == 'success' %}

@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Echoes</h1>
 
-<p class="hint">An Echo routes items from a Feed to a Mastodon Account using a template.</p>
+<p class="hint">An Echo routes items from a Feed to a destination (Mastodon or email) using a template.</p>
 
 <form method="post" action="/api/echoes" class="echo-form">
     <div class="form-row">
@@ -14,15 +14,25 @@
                 {% endfor %}
             </select>
         </label>
-        <label>Account
-            <select name="account_id" required>
-                {% for account in accounts %}
+        <label>Destination
+            <select name="destination_type" id="destination-type" onchange="toggleDestFields()">
+                {% if mastodon_accounts %}
+                <option value="mastodon">Mastodon Account</option>
+                {% endif %}
+                {% if email_accounts %}
+                <option value="email">Email Address</option>
+                {% endif %}
+            </select>
+        </label>
+    </div>
+    <div class="form-row" id="mastodon-fields">
+        <label>Mastodon Account
+            <select name="account_id">
+                {% for account in mastodon_accounts %}
                 <option value="{{ account.id }}">{{ account.name }} ({{ account.instance }})</option>
                 {% endfor %}
             </select>
         </label>
-    </div>
-    <div class="form-row">
         <label>Visibility
             <select name="visibility">
                 <option value="public">Public</option>
@@ -31,6 +41,17 @@
                 <option value="direct">Direct</option>
             </select>
         </label>
+    </div>
+    <div class="form-row" id="email-fields" style="display: none;">
+        <label>Email Address
+            <select name="email_account_id">
+                {% for account in email_accounts %}
+                <option value="{{ account.id }}">{{ account.name }} ({{ account.email }})</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div class="form-row">
         <label>Enabled
             <input type="checkbox" name="enabled" value="true" checked>
         </label>
@@ -61,7 +82,7 @@
     <thead>
         <tr>
             <th>Feed</th>
-            <th>Account</th>
+            <th>Destination</th>
             <th>Template</th>
             <th>Visibility</th>
             <th>Status</th>
@@ -72,7 +93,13 @@
         {% for echo in echoes %}
         <tr>
             <td data-label="Feed">{{ echo.feed_name }}</td>
-            <td data-label="Account">{{ echo.account_name }}</td>
+            <td data-label="Destination">
+                {% if echo.destination_type == 'mastodon' %}
+                <span class="badge badge-success">Mastodon</span> {{ echo.destination_name }}
+                {% elif echo.destination_type == 'email' %}
+                <span class="badge badge-success">Email</span> {{ echo.destination_name }}
+                {% endif %}
+            </td>
             <td data-label="Template"><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
             <td data-label="Visibility">{{ echo.visibility }}</td>
             <td data-label="Status">
@@ -96,4 +123,14 @@
 {% else %}
 <p class="empty-state">No echoes yet. Create one above.</p>
 {% endif %}
+
+<script>
+function toggleDestFields() {
+    const destType = document.getElementById('destination-type').value;
+    document.getElementById('mastodon-fields').style.display = destType === 'mastodon' ? '' : 'none';
+    document.getElementById('email-fields').style.display = destType === 'email' ? '' : 'none';
+}
+// Initialize on load
+toggleDestFields();
+</script>
 {% endblock %}

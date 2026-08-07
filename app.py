@@ -1,7 +1,7 @@
 """FeedEcho — self-hosted RSS feed cross-poster.
 
-Routes feed items to Mastodon accounts. Web UI for managing feeds,
-accounts, echoes, and viewing post history.
+Routes feed items to Mastodon accounts or email addresses. Web UI for managing
+feeds, accounts, echoes, settings, and viewing post history.
 """
 
 import os
@@ -21,11 +21,12 @@ from mastodon import test_connection, post_status, verify_credentials
 from template_engine import render_template, available_variables
 from scheduler import start_scheduler, stop_scheduler, check_feed
 from oauth import get_authorize_url, exchange_code, parse_state
+from email_sender import get_smtp_settings, test_smtp_connection
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
 
-app = FastAPI(title="FeedEcho", version="0.1.0")
+app = FastAPI(title="FeedEcho", version="0.2.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -63,39 +64,73 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_smtp_settings():
+    """Load SMTP settings as a flat dict for templates."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'smtp_%'"
+        ).fetchall()
+    if not rows:
+        return {}
+    return {row["key"]: row["value"] for row in rows}
+
+
+def _get_all_accounts():
+    """Fetch both Mastodon and email accounts."""
+    with get_db() as db:
+        mastodon = db.execute(
+            "SELECT id, name, instance, created_at FROM accounts ORDER BY name"
+        ).fetchall()
+        email = db.execute(
+            "SELECT id, name, email, created_at FROM email_accounts ORDER BY name"
+        ).fetchall()
+    return mastodon, email
+
+
 # ── Pages ───────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     with get_db() as db:
-        accounts = db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
+        mastodon_accounts = db.execute(
+            "SELECT COUNT(*) as c FROM accounts"
+        ).fetchone()["c"]
+        email_accounts = db.execute(
+            "SELECT COUNT(*) as c FROM email_accounts"
+        ).fetchone()["c"]
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
         echoes = db.execute("""
-            SELECT e.*, f.name as feed_name, f.url as feed_url,
-                   a.name as account_name, a.instance as account_instance
+            SELECT e.*, f.name as feed_name,
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN a.name || ' (' || a.instance || ')'
+                     WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
+                   END as destination_name
             FROM echoes e
             JOIN feeds f ON e.feed_id = f.id
-            JOIN accounts a ON e.account_id = a.id
+            LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
+            LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
             ORDER BY e.created_at DESC
         """).fetchall()
         recent_posts = db.execute("""
-            SELECT pi.*, f.name as feed_name, a.name as account_name, a.instance as account_instance
+            SELECT pi.*, f.name as feed_name, a.name as account_name, a.instance
             FROM posted_items pi
             JOIN echoes e ON pi.echo_id = e.id
             JOIN feeds f ON e.feed_id = f.id
-            JOIN accounts a ON e.account_id = a.id
+            LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
             ORDER BY pi.posted_at DESC
             LIMIT 20
         """).fetchall()
         stats = {
-            "accounts": len(accounts),
+            "accounts": mastodon_accounts + email_accounts,
             "feeds": len(feeds),
             "echoes": len(echoes),
             "active_echoes": sum(1 for e in echoes if e["enabled"]),
             "total_posts": db.execute("SELECT COUNT(*) FROM posted_items WHERE status = 'success'").fetchone()[0],
             "failed_posts": db.execute("SELECT COUNT(*) FROM posted_items WHERE status = 'failed'").fetchone()[0],
         }
-    return render("dashboard.html", request, accounts=accounts, feeds=feeds, echoes=echoes,
+    return render("dashboard.html", request, feeds=feeds, echoes=echoes,
                   recent_posts=recent_posts, stats=stats)
 
 
@@ -113,25 +148,40 @@ async def feeds_page(request: Request):
 
 @app.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request):
-    with get_db() as db:
-        # Don't select access_token — mask it in the UI
-        accounts = db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
-    return render("accounts.html", request, accounts=accounts)
+    mastodon_accounts, email_accounts = _get_all_accounts()
+    smtp_settings = _get_smtp_settings()
+    smtp_configured = bool(smtp_settings.get("smtp_host"))
+    return render("accounts.html", request,
+                  mastodon_accounts=mastodon_accounts,
+                  email_accounts=email_accounts,
+                  smtp_configured=smtp_configured)
 
 
 @app.get("/echoes", response_class=HTMLResponse)
 async def echoes_page(request: Request):
     with get_db() as db:
         echoes = db.execute("""
-            SELECT e.*, f.name as feed_name, a.name as account_name, a.instance
+            SELECT e.*, f.name as feed_name,
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN a.name
+                     WHEN e.destination_type = 'email' THEN ea.name
+                   END as destination_name
             FROM echoes e
             JOIN feeds f ON e.feed_id = f.id
-            JOIN accounts a ON e.account_id = a.id
+            LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
+            LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
             ORDER BY e.created_at DESC
         """).fetchall()
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
-        accounts = db.execute("SELECT id, name, instance FROM accounts ORDER BY name").fetchall()
-    return render("echoes.html", request, echoes=echoes, feeds=feeds, accounts=accounts,
+        mastodon_accounts = db.execute(
+            "SELECT id, name, instance FROM accounts ORDER BY name"
+        ).fetchall()
+        email_accounts = db.execute(
+            "SELECT id, name, email FROM email_accounts ORDER BY name"
+        ).fetchall()
+    return render("echoes.html", request, echoes=echoes, feeds=feeds,
+                  mastodon_accounts=mastodon_accounts,
+                  email_accounts=email_accounts,
                   template_vars=available_variables())
 
 
@@ -139,15 +189,33 @@ async def echoes_page(request: Request):
 async def history_page(request: Request):
     with get_db() as db:
         posts = db.execute("""
-            SELECT pi.*, f.name as feed_name, a.name as account_name, a.instance
+            SELECT pi.*, f.name as feed_name,
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN a.name
+                     WHEN e.destination_type = 'email' THEN ea.name
+                   END as account_name,
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN a.instance
+                     WHEN e.destination_type = 'email' THEN ea.email
+                   END as instance
             FROM posted_items pi
             JOIN echoes e ON pi.echo_id = e.id
             JOIN feeds f ON e.feed_id = f.id
-            JOIN accounts a ON e.account_id = a.id
+            LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
+            LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
             ORDER BY pi.posted_at DESC
             LIMIT 100
         """).fetchall()
     return render("history.html", request, posts=posts)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    smtp_settings = _get_smtp_settings()
+    smtp_configured = bool(smtp_settings.get("smtp_host"))
+    return render("settings.html", request,
+                  smtp_settings=smtp_settings,
+                  smtp_configured=smtp_configured)
 
 
 @app.get("/healthz")
@@ -155,7 +223,7 @@ async def healthz():
     return {"status": "ok"}
 
 
-# ── API: Accounts ───────────────────────────────────────────────────────────
+# ── API: Mastodon Accounts ──────────────────────────────────────────────────
 
 @app.post("/api/accounts")
 async def add_account(
@@ -187,6 +255,66 @@ async def delete_account(account_id: int):
     with get_db() as db:
         db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     return RedirectResponse(url="/accounts", status_code=303)
+
+
+# ── API: Email Accounts ─────────────────────────────────────────────────────
+
+@app.post("/api/email-accounts")
+async def add_email_account(
+    name: str = Form(...),
+    email: str = Form(...),
+):
+    with get_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO email_accounts (name, email) VALUES (?, ?)",
+            (name, email),
+        )
+    return RedirectResponse(url="/accounts?status=email_added", status_code=303)
+
+
+@app.post("/api/email-accounts/{account_id}/delete")
+async def delete_email_account(account_id: int):
+    with get_db() as db:
+        db.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
+    return RedirectResponse(url="/accounts", status_code=303)
+
+
+# ── API: Settings ───────────────────────────────────────────────────────────
+
+@app.post("/api/settings/smtp")
+async def save_smtp_settings(
+    smtp_host: str = Form(...),
+    smtp_port: int = Form(587),
+    smtp_username: str = Form(""),
+    smtp_password: str = Form(""),
+    smtp_from_email: str = Form(""),
+    smtp_from_name: str = Form("FeedEcho"),
+    smtp_use_tls: str = Form("1"),
+):
+    settings = {
+        "smtp_host": smtp_host,
+        "smtp_port": str(smtp_port),
+        "smtp_username": smtp_username,
+        "smtp_password": smtp_password,
+        "smtp_from_email": smtp_from_email,
+        "smtp_from_name": smtp_from_name,
+        "smtp_use_tls": smtp_use_tls,
+    }
+    with get_db() as db:
+        for key, value in settings.items():
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+    return RedirectResponse(url="/settings?status=saved", status_code=303)
+
+
+@app.post("/api/settings/smtp/test")
+async def test_smtp(
+    test_email: str = Form(""),
+):
+    success, message = test_smtp_connection(test_email if test_email else None)
+    return {"success": success, "message": message}
 
 
 # ── API: Feeds ──────────────────────────────────────────────────────────────
@@ -265,24 +393,40 @@ async def fetch_now(feed_id: int):
 # ── API: Echoes ─────────────────────────────────────────────────────────────
 
 VALID_VISIBILITY = {"public", "unlisted", "private", "direct"}
+VALID_DEST_TYPES = {"mastodon", "email"}
 
 
 @app.post("/api/echoes")
 async def add_echo(
     feed_id: int = Form(...),
-    account_id: int = Form(...),
+    destination_type: str = Form("mastodon"),
+    account_id: int = Form(None),
+    email_account_id: int = Form(None),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
     enabled: str = Form(""),
 ):
+    if destination_type not in VALID_DEST_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid destination type")
     if visibility not in VALID_VISIBILITY:
-        raise HTTPException(status_code=400, detail=f"Invalid visibility. Must be one of: {VALID_VISIBILITY}")
-    # HTML checkboxes: absent = unchecked, present = checked
+        raise HTTPException(status_code=400, detail=f"Invalid visibility")
+
+    # Resolve destination_id based on type
+    if destination_type == "mastodon":
+        destination_id = account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="account_id required for mastodon destination")
+    else:
+        destination_id = email_account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="email_account_id required for email destination")
+
     is_enabled = 1 if enabled else 0
     with get_db() as db:
         db.execute(
-            "INSERT INTO echoes (feed_id, account_id, template, visibility, enabled) VALUES (?, ?, ?, ?, ?)",
-            (feed_id, account_id, template, visibility, is_enabled),
+            """INSERT INTO echoes (feed_id, destination_type, destination_id, template, visibility, enabled)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (feed_id, destination_type, destination_id, template, visibility, is_enabled),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 
@@ -302,19 +446,6 @@ async def toggle_echo(echo_id: int):
 async def delete_echo(echo_id: int):
     with get_db() as db:
         db.execute("DELETE FROM echoes WHERE id = ?", (echo_id,))
-    return RedirectResponse(url="/echoes", status_code=303)
-
-
-@app.post("/api/echoes/{echo_id}/template")
-async def update_echo_template(
-    echo_id: int,
-    template: str = Form(...),
-):
-    with get_db() as db:
-        echo = db.execute("SELECT id FROM echoes WHERE id = ?", (echo_id,)).fetchone()
-        if not echo:
-            raise HTTPException(status_code=404, detail="Echo not found")
-        db.execute("UPDATE echoes SET template = ? WHERE id = ?", (template, echo_id))
     return RedirectResponse(url="/echoes", status_code=303)
 
 
@@ -354,8 +485,11 @@ async def oauth_connect(request: Request, instance: str = ""):
         return RedirectResponse(url=auth_url)
     except Exception as e:
         logger.error(f"OAuth connect failed for {instance}: {e}")
+        mastodon_accounts, email_accounts = _get_all_accounts()
         return render("accounts.html", request,
-                      accounts=_get_accounts(),
+                      mastodon_accounts=mastodon_accounts,
+                      email_accounts=email_accounts,
+                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
                       error=f"Failed to connect to {instance}: {e}")
 
 
@@ -363,8 +497,11 @@ async def oauth_connect(request: Request, instance: str = ""):
 async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     """Handle the OAuth callback from Mastodon."""
     if error:
+        mastodon_accounts, email_accounts = _get_all_accounts()
         return render("accounts.html", request,
-                      accounts=_get_accounts(),
+                      mastodon_accounts=mastodon_accounts,
+                      email_accounts=email_accounts,
+                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
                       error=f"Authorization denied: {error}")
 
     if not code or not state:
@@ -379,17 +516,22 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         token_data = exchange_code(instance, code)
     except Exception as e:
         logger.error(f"OAuth token exchange failed: {e}")
+        mastodon_accounts, email_accounts = _get_all_accounts()
         return render("accounts.html", request,
-                      accounts=_get_accounts(),
+                      mastodon_accounts=mastodon_accounts,
+                      email_accounts=email_accounts,
+                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
                       error=f"Token exchange failed: {e}")
 
     access_token = token_data.get("access_token")
     if not access_token:
+        mastodon_accounts, email_accounts = _get_all_accounts()
         return render("accounts.html", request,
-                      accounts=_get_accounts(),
+                      mastodon_accounts=mastodon_accounts,
+                      email_accounts=email_accounts,
+                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
                       error="No access token in response")
 
-    # Verify credentials to get the account name
     try:
         creds = verify_credentials(instance, access_token)
         name = creds.get("display_name") or creds.get("username", "Unknown")
@@ -399,7 +541,6 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         username = "unknown"
 
     with get_db() as db:
-        # Use INSERT OR REPLACE so re-authenticating an existing instance updates the token
         db.execute(
             """INSERT OR REPLACE INTO accounts (name, instance, access_token)
                VALUES (?, ?, ?)""",
@@ -407,12 +548,6 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         )
 
     return RedirectResponse(url="/accounts?status=connected", status_code=303)
-
-
-def _get_accounts():
-    """Helper to fetch accounts without tokens."""
-    with get_db() as db:
-        return db.execute("SELECT id, name, instance, created_at FROM accounts ORDER BY name").fetchall()
 
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
@@ -434,5 +569,4 @@ async def favicon():
 
 if __name__ == "__main__":
     import uvicorn
-    # Bind to localhost — use a reverse proxy for remote access
-    uvicorn.run(app, host="127.0.0.1", port=8453)
+    uvicorn.run(app, host="0.0.0.0", port=8453)
