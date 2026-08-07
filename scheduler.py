@@ -47,6 +47,7 @@ def check_feed(feed_id: int):
 
     if not echoes:
         logger.info(f"Feed {feed_id} ({feed_name}): no enabled echoes, skipping")
+        _update_last_fetched(feed_id)
         return
 
     # 2. Fetch feed (network I/O, no DB lock)
@@ -69,7 +70,7 @@ def check_feed(feed_id: int):
         with get_db() as db:
             db.execute(
                 "UPDATE feeds SET last_item_id = ?, last_fetched = ? WHERE id = ?",
-                (new_last_id, datetime.now(timezone.utc).isoformat(), feed_id),
+                (new_last_id, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
             )
         logger.info(f"Feed {feed_id} ({feed_name}): initialized last_item_id to {new_last_id}")
         return
@@ -94,7 +95,7 @@ def check_feed(feed_id: int):
     with get_db() as db:
         db.execute(
             "UPDATE feeds SET last_item_id = ?, last_fetched = ? WHERE id = ?",
-            (new_last_id, datetime.now(timezone.utc).isoformat(), feed_id),
+            (new_last_id, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
         )
 
 
@@ -206,7 +207,7 @@ def _update_last_fetched(feed_id: int):
     with get_db() as db:
         db.execute(
             "UPDATE feeds SET last_fetched = ? WHERE id = ?",
-            (datetime.now(timezone.utc).isoformat(), feed_id),
+            (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
         )
 
 
@@ -216,7 +217,7 @@ def check_all_feeds():
         feeds = db.execute("""
             SELECT id, name FROM feeds
             WHERE last_fetched IS NULL
-               OR last_fetched <= datetime('now', '-' || poll_interval || ' minutes')
+               OR REPLACE(last_fetched, 'T', ' ') <= datetime('now', '-' || poll_interval || ' minutes')
         """).fetchall()
 
     logger.info(f"Checking {len(feeds)} feed(s)")
