@@ -256,6 +256,20 @@ h2 { font-size: 1.1rem; margin: 1.25rem 0 0.5rem; }
     margin-top: 0.5rem;
     accent-color: var(--primary);
 }
+.edit-actions {
+    justify-content: flex-end;
+    padding-top: 0.5rem;
+}
+.echo-edit-form {
+    background: var(--surface);
+    border: 1px solid var(--primary);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    margin: 0;
+}
+.echo-edit-form .form-row {
+    margin-bottom: 0.4rem;
+}
 
 @media (max-width: 640px) {
     .form-row { flex-direction: column; }

@@ -442,6 +442,44 @@ async def toggle_echo(echo_id: int):
     return {"success": True, "enabled": bool(new_val)}
 
 
+@app.post("/api/echoes/{echo_id}/edit")
+async def edit_echo(
+    echo_id: int,
+    feed_id: int = Form(...),
+    destination_type: str = Form("mastodon"),
+    account_id: int = Form(None),
+    email_account_id: int = Form(None),
+    template: str = Form("{{ title }} {{ link }}"),
+    visibility: str = Form("public"),
+    enabled: str = Form(""),
+):
+    if destination_type not in VALID_DEST_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid destination type")
+    if visibility not in VALID_VISIBILITY:
+        raise HTTPException(status_code=400, detail=f"Invalid visibility")
+
+    if destination_type == "mastodon":
+        destination_id = account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="account_id required for mastodon destination")
+    else:
+        destination_id = email_account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="email_account_id required for email destination")
+
+    is_enabled = 1 if enabled else 0
+    with get_db() as db:
+        echo = db.execute("SELECT * FROM echoes WHERE id = ?", (echo_id,)).fetchone()
+        if not echo:
+            raise HTTPException(status_code=404, detail="Echo not found")
+        db.execute(
+            """UPDATE echoes SET feed_id = ?, destination_type = ?, destination_id = ?,
+               template = ?, visibility = ?, enabled = ? WHERE id = ?""",
+            (feed_id, destination_type, destination_id, template, visibility, is_enabled, echo_id),
+        )
+    return RedirectResponse(url="/echoes", status_code=303)
+
+
 @app.post("/api/echoes/{echo_id}/delete")
 async def delete_echo(echo_id: int):
     with get_db() as db:
