@@ -115,6 +115,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_echoes_feed
             ON echoes(feed_id)
         """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_posted_items_echo_item
+            ON posted_items(echo_id, item_id)
+        """)
 
 
 init_db()

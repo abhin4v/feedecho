@@ -6,6 +6,13 @@ finds matching echoes, renders templates, and dispatches to the destination
 
 Key design: network I/O happens OUTSIDE DB transactions. Each item is processed
 in its own short transaction to prevent lock contention and data loss.
+
+PENDING-ROW PATTERN: each (echo, item) pair is claimed via INSERT OR IGNORE
+with status='pending' before dispatch. The unique index on (echo_id, item_id)
+prevents duplicate claims. After dispatch the row is UPDATEd to success/failed.
+This fixes both the duplicate-post race (#3) and failed-post retry (#2): a
+failed pending row will be picked up on the next poll because item_id matches,
+the pending row already exists (so INSERT is ignored), and we retry.
 """
 
 import logging
@@ -31,6 +38,9 @@ def check_feed(feed_id: int):
     Network I/O (feed fetch + Mastodon posts / emails) happens outside DB
     transactions. Each item gets its own short transaction for cursor advance
     + post logging.
+
+    Cursor only advances past items where all echoes succeeded. Items with
+    any failed echo are retried on the next poll.
     """
     # 1. Read feed config (short transaction)
     with get_db() as db:
@@ -66,13 +76,12 @@ def check_feed(feed_id: int):
 
     # 3. Auto-initialize on first fetch
     if last_seen_id is None:
-        new_last_id = items[0]["id"] if items else None
         with get_db() as db:
             db.execute(
                 "UPDATE feeds SET last_item_id = ?, last_fetched = ? WHERE id = ?",
-                (new_last_id, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
+                (items[0]["id"], _now(), feed_id),
             )
-        logger.info(f"Feed {feed_id} ({feed_name}): initialized last_item_id to {new_last_id}")
+        logger.info(f"Feed {feed_id} ({feed_name}): initialized last_item_id to {items[0]['id']}")
         return
 
     # 4. Find new items (pure computation, no DB)
@@ -85,59 +94,87 @@ def check_feed(feed_id: int):
 
     logger.info(f"Feed {feed_id} ({feed_name}): {len(new_items)} new item(s)")
 
-    # 5. Process each item
+    # 5. Process each item — only advance cursor past fully-succeeded items
+    cursor_id = last_seen_id
     for item in new_items:
+        all_succeeded = True
         for echo in echoes:
-            process_echo(echo, item)
+            if not process_echo(echo, item):
+                all_succeeded = False
+        if all_succeeded:
+            cursor_id = item["id"]
 
-    # 6. Update last_item_id (short transaction)
-    new_last_id = items[0]["id"] if items else last_seen_id
+    # 6. Advance cursor only to last fully-succeeded item
     with get_db() as db:
         db.execute(
             "UPDATE feeds SET last_item_id = ?, last_fetched = ? WHERE id = ?",
-            (new_last_id, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
+            (cursor_id, _now(), feed_id),
         )
 
 
-def process_echo(echo, item: dict):
-    """Render template and dispatch to the destination for a single echo/item pair.
+def process_echo(echo, item: dict) -> bool:
+    """Process a single echo/item pair. Returns True if fully succeeded.
 
-    Supports Mastodon and email destinations. Uses per-item transactions.
+    Uses pending-row pattern: INSERT OR IGNORE a 'pending' row to claim the
+    (echo, item) pair. If the row already exists (from a prior attempt),
+    check its status: 'pending' = claimed by another concurrent run (skip);
+    'failed' = retry; 'success' = done. The unique index on (echo_id, item_id)
+    prevents duplicate claims.
     """
-    # Check if already posted successfully (short transaction)
+    echo_id = echo["id"]
+    item_id = item["id"]
+
+    # Try to claim this pair
     with get_db() as db:
-        already_posted = db.execute(
-            "SELECT id FROM posted_items WHERE echo_id = ? AND item_id = ? AND status = 'success'",
-            (echo["id"], item["id"]),
+        db.execute(
+            "INSERT OR IGNORE INTO posted_items (echo_id, item_id, item_title, item_url, status) "
+            "VALUES (?, ?, ?, ?, 'pending')",
+            (echo_id, item_id, item.get("title", ""), item.get("link", "")),
+        )
+        row = db.execute(
+            "SELECT id, status FROM posted_items WHERE echo_id = ? AND item_id = ?",
+            (echo_id, item_id),
         ).fetchone()
 
-    if already_posted:
-        logger.info(f"Echo {echo['id']}: item {item['id']} already posted successfully, skipping")
-        return
+    if not row:
+        return False  # shouldn't happen
+    if row["status"] == "success":
+        return True  # already done
+    if row["status"] == "pending" and db.total_changes == 0:
+        # Another concurrent run claimed this pair first
+        return False
 
-    # Render template (no DB)
-    content = render_template(echo["template"], item)
+    posted_id = row["id"]
+
+    # Render template (wrapped in try/except — #4 fix)
+    try:
+        content = render_template(echo["template"], item)
+    except Exception as e:
+        logger.error(f"Echo {echo_id}: template render failed for item {item_id}: {e}")
+        _update_post(posted_id, "failed", f"Template error: {e}")
+        return False
 
     if not content.strip():
-        logger.warning(f"Echo {echo['id']}: rendered content is empty, skipping")
-        _log_post(echo["id"], item, "failed", "Rendered content was empty")
-        return
+        logger.warning(f"Echo {echo_id}: rendered content is empty, skipping")
+        _update_post(posted_id, "failed", "Rendered content was empty")
+        return False
 
     # Dispatch based on destination type
     dest_type = echo["destination_type"]
     dest_id = echo["destination_id"]
 
     if dest_type == "mastodon":
-        _send_mastodon(echo, item, content, dest_id)
+        return _send_mastodon(echo, item, content, dest_id, posted_id)
     elif dest_type == "email":
-        _send_email_echo(echo, item, content, dest_id)
+        return _send_email_echo(echo, item, content, dest_id, posted_id)
     else:
-        logger.error(f"Echo {echo['id']}: unknown destination type '{dest_type}'")
-        _log_post(echo["id"], item, "failed", f"Unknown destination type: {dest_type}")
+        logger.error(f"Echo {echo_id}: unknown destination type '{dest_type}'")
+        _update_post(posted_id, "failed", f"Unknown destination type: {dest_type}")
+        return False
 
 
-def _send_mastodon(echo, item: dict, content: str, account_id: int):
-    """Post to Mastodon."""
+def _send_mastodon(echo, item: dict, content: str, account_id: int, posted_id: int) -> bool:
+    """Post to Mastodon. Returns True on success."""
     with get_db() as db:
         account = db.execute(
             "SELECT * FROM accounts WHERE id = ?", (account_id,)
@@ -145,27 +182,30 @@ def _send_mastodon(echo, item: dict, content: str, account_id: int):
 
     if not account:
         logger.error(f"Echo {echo['id']}: account {account_id} not found")
-        _log_post(echo["id"], item, "failed", f"Account {account_id} not found")
-        return
+        _update_post(posted_id, "failed", f"Account {account_id} not found")
+        return False
 
     content = truncate(content, MASTODON_MAX_CHARS)
 
     try:
-        result = post_status(
+        post_status(
             instance=account["instance"],
             access_token=account["access_token"],
             content=content,
             visibility=echo["visibility"],
         )
-        _log_post(echo["id"], item, "success", None)
-        logger.info(f"Echo {echo['id']}: posted '{item['title'][:50]}' to {account['instance']}")
+        _update_post(posted_id, "success", None)
+        title = item.get("title") or item.get("link", "?")
+        logger.info(f"Echo {echo['id']}: posted '{title[:50]}' to {account['instance']}")
+        return True
     except Exception as e:
-        _log_post(echo["id"], item, "failed", str(e))
+        _update_post(posted_id, "failed", str(e))
         logger.error(f"Echo {echo['id']}: Mastodon post failed: {e}")
+        return False
 
 
-def _send_email_echo(echo, item: dict, content: str, email_account_id: int):
-    """Send an email with the rendered template content."""
+def _send_email_echo(echo, item: dict, content: str, email_account_id: int, posted_id: int) -> bool:
+    """Send an email with the rendered template content. Returns True on success."""
     with get_db() as db:
         email_account = db.execute(
             "SELECT * FROM email_accounts WHERE id = ?", (email_account_id,)
@@ -173,10 +213,10 @@ def _send_email_echo(echo, item: dict, content: str, email_account_id: int):
 
     if not email_account:
         logger.error(f"Echo {echo['id']}: email account {email_account_id} not found")
-        _log_post(echo["id"], item, "failed", f"Email account {email_account_id} not found")
-        return
+        _update_post(posted_id, "failed", f"Email account {email_account_id} not found")
+        return False
 
-    subject = item.get("title", "FeedEcho: New Post")
+    subject = (item.get("title") or item.get("link") or "FeedEcho: New Post")
     subject = truncate(subject, 200)
 
     try:
@@ -185,20 +225,22 @@ def _send_email_echo(echo, item: dict, content: str, email_account_id: int):
             subject=subject,
             body=content,
         )
-        _log_post(echo["id"], item, "success", None)
-        logger.info(f"Echo {echo['id']}: emailed '{item['title'][:50]}' to {email_account['email']}")
+        _update_post(posted_id, "success", None)
+        title = item.get("title") or item.get("link", "?")
+        logger.info(f"Echo {echo['id']}: emailed '{title[:50]}' to {email_account['email']}")
+        return True
     except Exception as e:
-        _log_post(echo["id"], item, "failed", str(e))
+        _update_post(posted_id, "failed", str(e))
         logger.error(f"Echo {echo['id']}: email failed: {e}")
+        return False
 
 
-def _log_post(echo_id: int, item: dict, status: str, error: str | None = None):
-    """Log a post attempt to posted_items table (own transaction)."""
+def _update_post(posted_id: int, status: str, error: str | None = None):
+    """Update a post status after dispatch (own transaction)."""
     with get_db() as db:
         db.execute(
-            """INSERT INTO posted_items (echo_id, item_id, item_title, item_url, status, error_message)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (echo_id, item["id"], item.get("title", ""), item.get("link", ""), status, error),
+            "UPDATE posted_items SET status = ?, error_message = ? WHERE id = ?",
+            (status, error, posted_id),
         )
 
 
@@ -207,8 +249,13 @@ def _update_last_fetched(feed_id: int):
     with get_db() as db:
         db.execute(
             "UPDATE feeds SET last_fetched = ? WHERE id = ?",
-            (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), feed_id),
+            (_now(), feed_id),
         )
+
+
+def _now() -> str:
+    """Current UTC time in SQLite-compatible format."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def check_all_feeds():

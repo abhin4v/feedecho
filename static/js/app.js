@@ -1,5 +1,8 @@
 // FeedEcho — client-side interactions
 
+// Store original row HTML for cancelEdit; avoids XSS from inline HTML serialization
+const editState = new Map();
+
 async function testAccount(accountId) {
     try {
         const resp = await fetch(`/api/accounts/${accountId}/test`, { method: 'POST' });
@@ -62,8 +65,9 @@ function editEcho(echoId) {
     const row = document.getElementById(`echo-row-${echoId}`);
     if (!row) return;
 
-    // Store original HTML to restore on cancel
+    // Store original HTML to restore on cancel (in memory, not in DOM attribute)
     const originalHTML = row.innerHTML;
+    editState.set(echoId, originalHTML);
 
     const feedId = row.dataset.feedId;
     const destType = row.dataset.destinationType;
@@ -122,7 +126,7 @@ function editEcho(echoId) {
             </div>
             <div class="form-row edit-actions">
                 <button type="submit" class="btn-sm">Save</button>
-                <button type="button" class="btn-sm btn-danger" onclick="cancelEdit(${echoId}, ${JSON.stringify(escapeHTML(originalHTML))})">Cancel</button>
+                <button type="button" class="btn-sm btn-danger" onclick="cancelEdit(${echoId})">Cancel</button>
             </div>
         </form>
     </td>`;
@@ -142,9 +146,12 @@ function toggleEditDest(echoId) {
     document.getElementById(`edit-email-fields-${echoId}`).style.display = destType === 'email' ? '' : 'none';
 }
 
-function cancelEdit(echoId, originalHTML) {
+function cancelEdit(echoId) {
     const row = document.getElementById(`echo-row-${echoId}`);
-    if (row) row.innerHTML = originalHTML;
+    if (row && editState.has(echoId)) {
+        row.innerHTML = editState.get(echoId);
+        editState.delete(echoId);
+    }
 }
 
 function escapeHTML(str) {
