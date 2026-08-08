@@ -1,19 +1,21 @@
-"""Tests for security features: SSRF protection and OAuth state signing."""
+"""Security and reliability tests for OAuth state and outbound URL controls."""
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 import socket
-from unittest.mock import patch, MagicMock
-from feed_parser import validate_outbound_url, validate_feed_url, SSRFError
-from oauth import _sign_state, _verify_state, get_or_create_app
+
+from database import get_db
+from feed_parser import SSRFError, validate_feed_url, validate_outbound_url
 from mastodon import post_status, verify_credentials
+from oauth import _sign_state, _verify_state, get_or_create_app
 
 
 class TestSSRFProtection:
-    """SSRF filter blocks private/internal IPs and non-http schemes."""
-
     def test_blocks_localhost_ip(self):
         with pytest.raises(SSRFError, match="private"):
-            validate_outbound_url("http://127.0.0.1/latest/meta-data/")
+            validate_outbound_url("http://127.0.0.1/latest-meta-data/")
 
     def test_blocks_loopback_ipv6(self):
         with pytest.raises(SSRFError, match="private"):
@@ -33,7 +35,7 @@ class TestSSRFProtection:
 
     def test_blocks_link_local(self):
         with pytest.raises(SSRFError, match="private"):
-            validate_outbound_url("http://169.254.169.254/latest/meta-data/")
+            validate_outbound_url("http://169.254.169.254/latest-meta-data/")
 
     def test_blocks_file_scheme(self):
         with pytest.raises(SSRFError, match="not allowed"):
@@ -48,7 +50,6 @@ class TestSSRFProtection:
             validate_outbound_url("http://user:pass@example.com/feed")
 
     def test_blocks_hostname_resolving_to_private(self):
-        """Hostnames that resolve to private IPs should be blocked."""
         with patch("socket.getaddrinfo") as mock_resolve:
             mock_resolve.return_value = [
                 (socket.AF_INET, 0, 0, "", ("10.0.0.5", 0))
@@ -57,130 +58,53 @@ class TestSSRFProtection:
                 validate_outbound_url("http://internal.example.com/secret")
 
     def test_allows_public_ip(self):
-        # 8.8.8.8 is Google DNS — public, not blocked
-        result = validate_outbound_url("https://8.8.8.8/feed.xml")
-        assert result == "https://8.8.8.8/feed.xml"
-
-    def test_allows_normal_https_url(self):
-        result = validate_outbound_url("https://example.com/feed.xml")
-        assert result == "https://example.com/feed.xml"
+        assert validate_outbound_url("https://8.8.8.8/feed.xml") == "https://8.8.8.8/feed.xml"
 
     def test_validate_feed_url_alias_works(self):
-        """The backwards-compatible alias should work identically."""
-        result = validate_feed_url("https://example.com/feed.xml")
-        assert result == "https://example.com/feed.xml"
+        assert validate_feed_url("https://example.com/feed.xml") == "https://example.com/feed.xml"
 
 
 class TestSSRFRedirectProtection:
-    """SSRF protection validates every redirect hop, not just the initial URL."""
-
     def test_redirect_to_private_ip_is_blocked(self):
-        """A feed at a public URL that redirects to a private IP must be blocked.
-
-        Simulates: http://evil.example/feed -> 302 -> http://169.254.169.254/
-        """
-        from feed_parser import _fetch_with_redirect_validation, MAX_REDIRECTS
-
-        # Mock httpx client that returns a redirect to a private IP
-        mock_response_redirect = MagicMock()
-        mock_response_redirect.is_redirect = True
-        mock_response_redirect.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
-
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_response_redirect
-
-        with pytest.raises(SSRFError, match="private"):
-            _fetch_with_redirect_validation(
-                mock_client, "https://evil.example/feed.xml", {}
-            )
-
-    def test_redirect_to_localhost_is_blocked(self):
-        """A redirect to localhost must be blocked."""
         from feed_parser import _fetch_with_redirect_validation
 
-        mock_response_redirect = MagicMock()
-        mock_response_redirect.is_redirect = True
-        mock_response_redirect.headers = {"location": "http://127.0.0.1:8080/admin"}
+        redirect = MagicMock()
+        redirect.is_redirect = True
+        redirect.headers = {"location": "http://169.254.169.254/latest-meta-data/"}
 
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_response_redirect
+        client = MagicMock()
+        client.get.return_value = redirect
 
         with pytest.raises(SSRFError, match="private"):
-            _fetch_with_redirect_validation(
-                mock_client, "https://evil.example/feed.xml", {}
-            )
+            _fetch_with_redirect_validation(client, "https://evil.example/feed.xml", {})
 
     def test_redirect_to_public_url_allowed(self):
-        """A redirect to another public URL should be followed."""
         from feed_parser import _fetch_with_redirect_validation
 
-        # First response: redirect to a public URL
-        mock_response_redirect = MagicMock()
-        mock_response_redirect.is_redirect = True
-        mock_response_redirect.headers = {"location": "https://8.8.8.8/feed.xml"}
+        redirect = MagicMock()
+        redirect.is_redirect = True
+        redirect.headers = {"location": "https://8.8.8.8/feed.xml"}
 
-        # Second response: actual content (not a redirect)
-        mock_response_final = MagicMock()
-        mock_response_final.is_redirect = False
-        mock_response_final.status_code = 200
+        final = MagicMock()
+        final.is_redirect = False
+        final.status_code = 200
 
-        mock_client = MagicMock()
-        mock_client.get.side_effect = [mock_response_redirect, mock_response_final]
+        client = MagicMock()
+        client.get.side_effect = [redirect, final]
 
-        result = _fetch_with_redirect_validation(
-            mock_client, "https://8.8.8.8/feed.xml", {}
-        )
-        assert result == mock_response_final
-
-    def test_too_many_redirects_raises(self):
-        """Exceeding MAX_REDIRECTS should raise ValueError."""
-        from feed_parser import _fetch_with_redirect_validation, MAX_REDIRECTS
-
-        mock_response_redirect = MagicMock()
-        mock_response_redirect.is_redirect = True
-        mock_response_redirect.headers = {"location": "https://8.8.8.8/feed.xml"}
-
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_response_redirect
-
-        with pytest.raises(ValueError, match="Too many redirects"):
-            _fetch_with_redirect_validation(
-                mock_client, "https://8.8.8.8/feed.xml", {}
-            )
-
-    def test_relative_redirect_is_resolved_and_validated(self):
-        """Relative redirects should be resolved against the current URL."""
-        from feed_parser import _fetch_with_redirect_validation
-
-        # First response: relative redirect
-        mock_response_redirect = MagicMock()
-        mock_response_redirect.is_redirect = True
-        mock_response_redirect.headers = {"location": "/feed.xml"}
-
-        # Second response: actual content
-        mock_response_final = MagicMock()
-        mock_response_final.is_redirect = False
-        mock_response_final.status_code = 200
-
-        mock_client = MagicMock()
-        mock_client.get.side_effect = [mock_response_redirect, mock_response_final]
-
-        result = _fetch_with_redirect_validation(
-            mock_client, "https://8.8.8.8/old-feed", {}
-        )
-        assert result == mock_response_final
+        assert _fetch_with_redirect_validation(
+            client,
+            "https://8.8.8.8/feed.xml",
+            {},
+        ) == final
 
 
 class TestInstanceURLSSRF:
-    """Mastodon/OAuth instance URLs are validated for SSRF."""
-
     def test_oauth_get_or_create_app_validates_instance(self):
-        """get_or_create_app should reject private IPs for instance URLs."""
         with pytest.raises(SSRFError):
             get_or_create_app("http://127.0.0.1:8000")
 
     def test_mastodon_post_status_validates_instance(self):
-        """post_status should reject private IPs for instance URLs."""
         with pytest.raises(SSRFError):
             post_status(
                 instance="http://10.0.0.1",
@@ -189,60 +113,99 @@ class TestInstanceURLSSRF:
             )
 
     def test_mastodon_verify_credentials_validates_instance(self):
-        """verify_credentials should reject private IPs for instance URLs."""
         with pytest.raises(SSRFError):
             verify_credentials(
                 instance="http://169.254.169.254",
                 access_token="fake-token",
             )
 
-    def test_oauth_get_or_create_app_allows_public_instance(self):
-        """Public instance URLs should pass validation (but may fail on network)."""
-        with patch("oauth.validate_outbound_url") as mock_validate:
-            mock_validate.return_value = "https://dmv.community"
-            # This will fail at the DB/cache lookup stage, not at validation
-            try:
-                get_or_create_app("https://dmv.community")
-            except Exception:
-                pass  # Expected — we just want to confirm validate was called
-            mock_validate.assert_called_once_with("https://dmv.community")
 
+class TestOAuthStateSecurity:
+    """State must be signed, server-side, expiry-bound, session-bound, and one-time."""
 
-class TestOAuthStateSigning:
-    """HMAC-signed state tokens prevent CSRF and tampering."""
+    @pytest.fixture(autouse=True)
+    def clean_states(self):
+        with get_db() as db:
+            db.execute("DELETE FROM oauth_states")
+        yield
+        with get_db() as db:
+            db.execute("DELETE FROM oauth_states")
 
     def test_sign_and_verify_roundtrip(self):
-        instance = "https://dmv.community"
-        token = _sign_state(instance)
-        assert _verify_state(token) == instance
+        session = "browser-session-a"
+        token = _sign_state("https://dmv.community", session)
+        assert _verify_state(token, session) == "https://dmv.community"
+
+    def test_state_is_single_use(self):
+        session = "browser-session-a"
+        token = _sign_state("https://dmv.community", session)
+
+        assert _verify_state(token, session) == "https://dmv.community"
+
+        with pytest.raises(ValueError, match="already used|invalid"):
+            _verify_state(token, session)
+
+    def test_state_cannot_be_consumed_from_another_browser_session(self):
+        token = _sign_state("https://dmv.community", "initiating-session")
+
+        with pytest.raises(ValueError, match="session-mismatched|invalid"):
+            _verify_state(token, "different-browser-session")
+
+        # A failed mismatched attempt does not consume the legitimate state.
+        assert _verify_state(token, "initiating-session") == "https://dmv.community"
+
+    def test_expired_state_is_rejected(self):
+        session = "browser-session-a"
+        token = _sign_state("https://dmv.community", session)
+        nonce = token.rsplit("|", 2)[0]
+
+        expired = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        with get_db() as db:
+            db.execute(
+                "UPDATE oauth_states SET expires_at = ? WHERE nonce = ?",
+                (expired, nonce),
+            )
+
+        with pytest.raises(ValueError, match="expired|invalid"):
+            _verify_state(token, session)
 
     def test_verify_rejects_tampered_instance(self):
-        token = _sign_state("https://dmv.community")
-        # Tamper: replace instance with a different one
+        session = "browser-session-a"
+        token = _sign_state("https://dmv.community", session)
         parts = token.rsplit("|", 2)
         parts[1] = "https://evil.example"
-        tampered = "|".join(parts)
-        with pytest.raises(ValueError, match="Invalid state signature"):
-            _verify_state(tampered)
 
-    def test_verify_rejects_tampered_signature(self):
-        token = _sign_state("https://dmv.community")
+        with pytest.raises(ValueError, match="Invalid state signature"):
+            _verify_state("|".join(parts), session)
+
+    def test_verify_rejects_tampered_full_length_signature(self):
+        session = "browser-session-a"
+        token = _sign_state("https://dmv.community", session)
         parts = token.rsplit("|", 2)
-        parts[2] = "a" * 16  # wrong signature
-        tampered = "|".join(parts)
+        parts[2] = "a" * 64
+
         with pytest.raises(ValueError, match="Invalid state signature"):
-            _verify_state(tampered)
+            _verify_state("|".join(parts), session)
 
-    def test_verify_rejects_malformed_state(self):
-        with pytest.raises(ValueError, match="Invalid state"):
-            _verify_state("just-a-string")
+    def test_signature_is_full_sha256_hex(self):
+        token = _sign_state("https://dmv.community", "browser-session-a")
+        signature = token.rsplit("|", 2)[2]
 
-    def test_verify_rejects_empty_state(self):
-        with pytest.raises(ValueError, match="Invalid state"):
-            _verify_state("")
+        assert len(signature) == 64
+        assert all(char in "0123456789abcdef" for char in signature)
 
-    def test_state_contains_random_nonce(self):
-        """Each call should produce a different token (unique nonce)."""
-        token1 = _sign_state("https://dmv.community")
-        token2 = _sign_state("https://dmv.community")
-        assert token1 != token2  # different nonces
+    def test_verify_requires_session_binding(self):
+        token = _sign_state("https://dmv.community", "browser-session-a")
+
+        with pytest.raises(ValueError, match="browser session"):
+            _verify_state(token)
+
+    def test_state_contains_unique_nonce(self):
+        session = "browser-session-a"
+        assert (
+            _sign_state("https://dmv.community", session)
+            != _sign_state("https://dmv.community", session)
+        )

@@ -1,23 +1,56 @@
-"""Database layer — SQLite with WAL mode, matches vinyl-catalog pattern."""
+"""Database layer — SQLite with WAL mode and concurrency-safe migrations."""
 
-import sqlite3
 import os
+import sqlite3
 from pathlib import Path
+from contextlib import contextmanager
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("FEEDCHO_DB_PATH", BASE_DIR / "feedecho.db"))
 
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+@contextmanager
+def get_db():
+    """Yield a SQLite connection, closing it when done.
+
+    Uses busy_timeout=30s for write contention. WAL mode is set once
+    during init_db, not per-connection.
+    """
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def init_db():
+def _column_names(db: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row["name"] for row in db.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _add_column_if_missing(
+    db: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    if column_name not in _column_names(db, table_name):
+        db.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )
+
+
+def init_db() -> None:
+    """Create and migrate the application schema."""
     with get_db() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,19 +61,25 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migration: add username column if missing, populate from existing names
-        cols = db.execute("PRAGMA table_info(accounts)").fetchall()
-        col_names = [c["name"] for c in cols]
-        if "username" not in col_names:
+
+        account_columns = _column_names(db, "accounts")
+        if "username" not in account_columns:
             db.execute("ALTER TABLE accounts ADD COLUMN username TEXT DEFAULT ''")
             rows = db.execute("SELECT id, name FROM accounts").fetchall()
             import re
+
             for row in rows:
-                m = re.search(r'\(([^)]+)\)$', row["name"] or "")
-                if m:
-                    db.execute("UPDATE accounts SET username = ? WHERE id = ?", (m.group(1), row["id"]))
-                else:
-                    db.execute("UPDATE accounts SET username = ? WHERE id = ?", (row["name"] or "unknown", row["id"]))
+                match = re.search(r"\(([^)]+)\)$", row["name"] or "")
+                username = (
+                    match.group(1)
+                    if match
+                    else (row["name"] or "unknown")
+                )
+                db.execute(
+                    "UPDATE accounts SET username = ? WHERE id = ?",
+                    (username, row["id"]),
+                )
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS feeds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,14 +89,22 @@ def init_db():
                 poll_interval INTEGER DEFAULT 15,
                 last_fetched TIMESTAMP,
                 last_item_id TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migrate old echoes schema if needed
-        cols = db.execute("PRAGMA table_info(echoes)").fetchall()
-        col_names = [c["name"] for c in cols]
-        if col_names and "account_id" in col_names and "destination_type" not in col_names:
+        _add_column_if_missing(db, "feeds", "lease_token", "TEXT")
+        _add_column_if_missing(db, "feeds", "lease_expires_at", "TIMESTAMP")
+
+        echo_columns = _column_names(db, "echoes")
+        if (
+            echo_columns
+            and "account_id" in echo_columns
+            and "destination_type" not in echo_columns
+        ):
             db.execute("DROP TABLE echoes")
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS echoes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +118,7 @@ def init_db():
                 FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
             )
         """)
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS email_accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,12 +127,14 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS posted_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,10 +144,22 @@ def init_db():
                 item_url TEXT,
                 status TEXT NOT NULL,
                 error_message TEXT,
+                claimed_at TIMESTAMP,
+                claim_token TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (echo_id) REFERENCES echoes(id) ON DELETE CASCADE
             )
         """)
+        _add_column_if_missing(db, "posted_items", "claimed_at", "TIMESTAMP")
+        _add_column_if_missing(db, "posted_items", "claim_token", "TEXT")
+        _add_column_if_missing(
+            db,
+            "posted_items",
+            "attempt_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS oauth_apps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,17 +169,48 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                nonce TEXT PRIMARY KEY,
+                instance TEXT NOT NULL,
+                session_binding TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                consumed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_posted_items_echo
             ON posted_items(echo_id, posted_at DESC)
+        """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_posted_items_echo_item
+            ON posted_items(echo_id, item_id)
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posted_items_reclaim
+            ON posted_items(status, claimed_at)
         """)
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_echoes_feed
             ON echoes(feed_id)
         """)
         db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_posted_items_echo_item
-            ON posted_items(echo_id, item_id)
+            CREATE INDEX IF NOT EXISTS idx_feeds_lease
+            ON feeds(lease_expires_at)
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oauth_states_expiry
+            ON oauth_states(expires_at)
+        """)
+
+        # Best-effort cleanup of expired/consumed state rows.
+        db.execute("""
+            DELETE FROM oauth_states
+            WHERE consumed_at IS NOT NULL
+               OR expires_at <= datetime('now', '-1 day')
         """)
 
 

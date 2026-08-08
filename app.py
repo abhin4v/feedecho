@@ -28,7 +28,7 @@ from email_sender import get_smtp_settings, test_smtp_connection
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
 
-app = FastAPI(title="FeedEcho", version="1.0.0")
+app = FastAPI(title="FeedEcho", version="1.1.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -37,6 +37,9 @@ jinja = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
     autoescape=select_autoescape(["html"]),
 )
+
+OAUTH_SESSION_COOKIE = "feedecho_oauth_session"
+OAUTH_SESSION_MAX_AGE = 10 * 60
 
 # ── Optional shared-secret auth ──────────────────────────────────────────────
 # If FEEDCHO_AUTH_TOKEN is set, all requests must include it as either:
@@ -623,67 +626,108 @@ async def preview_template(
 
 @app.get("/oauth/connect")
 async def oauth_connect(request: Request, instance: str = ""):
-    """Redirect to Mastodon OAuth authorize page."""
+    """Start a session-bound Mastodon OAuth authorization flow."""
     if not instance:
         raise HTTPException(status_code=400, detail="Instance URL is required")
+
     instance = validate_url(instance)
+
+    # This cookie is independent from shared-secret auth. It ties the OAuth
+    # callback to the browser session that initiated the flow.
+    oauth_session = request.cookies.get(OAUTH_SESSION_COOKIE)
+    if not oauth_session:
+        oauth_session = _secrets.token_urlsafe(32)
+
     try:
-        auth_url = get_authorize_url(instance)
-        return RedirectResponse(url=auth_url)
-    except Exception as e:
-        logger.error(f"OAuth connect failed for {instance}: {e}")
+        auth_url = get_authorize_url(instance, oauth_session)
+    except Exception:
+        logger.exception("OAuth connect failed for %s", instance)
         mastodon_accounts, email_accounts = _get_all_accounts()
-        return render("accounts.html", request,
-                      mastodon_accounts=mastodon_accounts,
-                      email_accounts=email_accounts,
-                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-                      error=f"Failed to connect to {instance}: {e}")
+        return render(
+            "accounts.html",
+            request,
+            mastodon_accounts=mastodon_accounts,
+            email_accounts=email_accounts,
+            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
+            error="Failed to start OAuth authorization. Verify the instance URL and try again.",
+        )
+
+    response = RedirectResponse(url=auth_url, status_code=302)
+    response.set_cookie(
+        key=OAUTH_SESSION_COOKIE,
+        value=oauth_session,
+        max_age=OAUTH_SESSION_MAX_AGE,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/oauth",
+    )
+    return response
 
 
 @app.get("/oauth/callback")
-async def oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    """Handle the OAuth callback from Mastodon."""
+async def oauth_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+    error: str = "",
+):
+    """Handle a one-time, session-bound Mastodon OAuth callback."""
     if error:
         mastodon_accounts, email_accounts = _get_all_accounts()
-        return render("accounts.html", request,
-                      mastodon_accounts=mastodon_accounts,
-                      email_accounts=email_accounts,
-                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-                      error=f"Authorization denied: {error}")
+        return render(
+            "accounts.html",
+            request,
+            mastodon_accounts=mastodon_accounts,
+            email_accounts=email_accounts,
+            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
+            error="Authorization was denied by the OAuth provider.",
+        )
 
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state parameter")
 
+    oauth_session = request.cookies.get(OAUTH_SESSION_COOKIE)
+    if not oauth_session:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth session is missing or expired. Start the connection again.",
+        )
+
     try:
-        instance = verify_state(state)
+        instance = verify_state(state, oauth_session)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid, expired, already-used, or session-mismatched OAuth state.",
+        )
 
     try:
         token_data = exchange_code(instance, code)
-    except Exception as e:
-        logger.error(f"OAuth token exchange failed: {e}")
+    except Exception:
+        logger.exception("OAuth token exchange failed for %s", instance)
         mastodon_accounts, email_accounts = _get_all_accounts()
-        return render("accounts.html", request,
-                      mastodon_accounts=mastodon_accounts,
-                      email_accounts=email_accounts,
-                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-                      error=f"Token exchange failed: {e}")
+        response = render(
+            "accounts.html",
+            request,
+            mastodon_accounts=mastodon_accounts,
+            email_accounts=email_accounts,
+            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
+            error="OAuth token exchange failed. Please try connecting again.",
+        )
+        response.delete_cookie(OAUTH_SESSION_COOKIE, path="/oauth")
+        return response
 
     access_token = token_data.get("access_token")
-    if not access_token:
-        mastodon_accounts, email_accounts = _get_all_accounts()
-        return render("accounts.html", request,
-                      mastodon_accounts=mastodon_accounts,
-                      email_accounts=email_accounts,
-                      smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-                      error="No access token in response")
+    if not isinstance(access_token, str) or not access_token:
+        raise HTTPException(status_code=502, detail="OAuth provider returned no access token")
 
     try:
         creds = verify_credentials(instance, access_token)
         display_name = creds.get("display_name") or creds.get("username", "Unknown")
         username = creds.get("username", "unknown")
     except Exception:
+        logger.exception("Could not verify OAuth credentials for %s", instance)
         display_name = "Unknown"
         username = "unknown"
 
@@ -694,7 +738,9 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
             (display_name, username, instance, access_token),
         )
 
-    return RedirectResponse(url="/accounts?status=connected", status_code=303)
+    response = RedirectResponse(url="/accounts?status=connected", status_code=303)
+    response.delete_cookie(OAUTH_SESSION_COOKIE, path="/oauth")
+    return response
 
 
 # ── Misc ─────────────────────────────────────────────────────────────────────

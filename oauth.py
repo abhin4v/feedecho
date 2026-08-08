@@ -1,137 +1,211 @@
-"""Mastodon OAuth — register app, authorize, exchange code for token.
+"""Mastodon OAuth registration, authorization state, and token exchange."""
 
-Flow:
-1. User enters instance URL
-2. We register an OAuth app on that instance → get client_id/secret
-3. Redirect user to instance OAuth authorize page
-4. User authorizes → Mastodon redirects back with ?code=XXX
-5. We exchange code for access token
-6. Store the account with the token
-"""
+from __future__ import annotations
 
-import httpx
-import hmac
 import hashlib
+import hmac
 import os
 import secrets
-from database import get_db
-from feed_parser import validate_outbound_url, SSRFError
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
-# The public URL that Mastodon will redirect back to.
-# Configurable via FEEDCHO_CALLBACK_URL env var so self-hosters don't edit source.
+import httpx
+
+from database import get_db
+from feed_parser import SSRFError, validate_outbound_url
+
 CALLBACK_URL = os.environ.get(
     "FEEDCHO_CALLBACK_URL",
     "https://feedecho.snakepit.us/oauth/callback",
 )
 SCOPES = "read write"
+STATE_TTL_SECONDS = 10 * 60
 
-# Secret key for HMAC-signing OAuth state tokens. Uses the same env var as
-# the auth middleware if set, falls back to a per-process random key (state
-# tokens won't survive a restart, but OAuth flows complete within seconds).
 _STATE_SECRET = os.environ.get(
     "FEEDCHO_AUTH_TOKEN",
     os.environ.get("FEEDCHO_STATE_SECRET", secrets.token_urlsafe(32)),
-).encode()
+).encode("utf-8")
 
 
-def _sign_state(instance: str) -> str:
-    """Create an HMAC-signed state token for the given instance.
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    Format: <random_nonce>|<instance>|<hmac>
-    Uses | as delimiter because instance URLs contain : (https://).
-    The HMAC covers nonce + instance, preventing tampering with the
-    instance field or forging a valid state without the secret.
+
+def _sqlite_timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hash_session_binding(session_binding: str) -> str:
+    """Avoid storing a browser session secret in plaintext."""
+    return hashlib.sha256(session_binding.encode("utf-8")).hexdigest()
+
+
+def _state_signature(nonce: str, instance: str) -> str:
+    payload = f"{nonce}|{instance}".encode("utf-8")
+    return hmac.new(_STATE_SECRET, payload, hashlib.sha256).hexdigest()
+
+
+def _sign_state(instance: str, session_binding: str | None = None) -> str:
+    """Create and persist a one-time OAuth state token.
+
+    `session_binding` must be a cryptographically random browser session value.
+    It is stored hashed and must be presented again when consuming state.
+
+    The optional default is retained only for compatibility with direct callers;
+    production callers must provide a browser-session binding.
     """
-    nonce = secrets.token_urlsafe(16)
-    payload = f"{nonce}|{instance}"
-    sig = hmac.new(_STATE_SECRET, payload.encode(), hashlib.sha256).hexdigest()[:16]
-    return f"{payload}|{sig}"
+    if session_binding is None:
+        session_binding = secrets.token_urlsafe(32)
+
+    instance = instance.rstrip("/")
+    nonce = secrets.token_urlsafe(32)
+    signature = _state_signature(nonce, instance)
+    expires_at = _sqlite_timestamp(_now() + timedelta(seconds=STATE_TTL_SECONDS))
+
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO oauth_states (nonce, instance, session_binding, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (nonce, instance, _hash_session_binding(session_binding), expires_at),
+        )
+
+    return f"{nonce}|{instance}|{signature}"
 
 
-def _verify_state(state: str) -> str:
-    """Verify an HMAC-signed state token and return the instance.
+def _verify_state(state: str, session_binding: str | None = None) -> str:
+    """Validate and atomically consume an OAuth state token.
 
-    Raises ValueError if the signature is invalid or the token is malformed.
+    A state token is valid only when all of these conditions hold:
+
+    * its full SHA-256 HMAC is valid;
+    * its server-side record exists;
+    * it is bound to the initiating browser session;
+    * it has not expired;
+    * it has not been consumed previously.
+
+    The atomic UPDATE is the single-use guarantee.
     """
+    if session_binding is None:
+        raise ValueError("OAuth state is not bound to a browser session")
+
     parts = state.rsplit("|", 2)
     if len(parts) != 3:
-        raise ValueError(f"Invalid state parameter: {state}")
-    nonce, instance, sig = parts
-    payload = f"{nonce}|{instance}"
-    expected_sig = hmac.new(_STATE_SECRET, payload.encode(), hashlib.sha256).hexdigest()[:16]
-    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError("Invalid state parameter")
+
+    nonce, instance, signature = parts
+    if not nonce or not instance or not signature:
+        raise ValueError("Invalid state parameter")
+
+    expected_signature = _state_signature(nonce, instance)
+    if not hmac.compare_digest(signature, expected_signature):
         raise ValueError("Invalid state signature")
+
+    binding_hash = _hash_session_binding(session_binding)
+    now = _sqlite_timestamp(_now())
+
+    with get_db() as db:
+        result = db.execute(
+            """
+            UPDATE oauth_states
+               SET consumed_at = ?
+             WHERE nonce = ?
+               AND instance = ?
+               AND session_binding = ?
+               AND consumed_at IS NULL
+               AND expires_at > ?
+            """,
+            (now, nonce, instance, binding_hash, now),
+        )
+        if result.rowcount != 1:
+            raise ValueError("OAuth state is invalid, expired, already used, or session-mismatched")
+
     return instance
 
 
 def get_or_create_app(instance: str) -> dict:
-    """Register an OAuth app on the instance, or return cached credentials.
-
-    Returns: {client_id, client_secret}
-    """
+    """Register an OAuth app on an instance, or return cached credentials."""
     instance = instance.rstrip("/")
     validate_outbound_url(instance)
 
-    # Check cache first
     with get_db() as db:
         row = db.execute(
             "SELECT client_id, client_secret FROM oauth_apps WHERE instance = ?",
             (instance,),
         ).fetchone()
         if row:
-            return {"client_id": row["client_id"], "client_secret": row["client_secret"]}
+            return {
+                "client_id": row["client_id"],
+                "client_secret": row["client_secret"],
+            }
 
-    # Register a new app
-    url = f"{instance}/api/v1/apps"
     data = {
         "client_name": "FeedEcho",
         "redirect_uris": CALLBACK_URL,
         "scopes": SCOPES,
         "website": "https://feedecho.snakepit.us",
     }
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(url, data=data)
-        resp.raise_for_status()
-        result = resp.json()
 
-    # Cache it
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=False,
+        ) as client:
+            response = client.post(f"{instance}/api/v1/apps", data=data)
+            response.raise_for_status()
+            result = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError("Unable to register OAuth application with instance") from exc
+
+    client_id = result.get("client_id")
+    client_secret = result.get("client_secret")
+    if not isinstance(client_id, str) or not isinstance(client_secret, str):
+        raise RuntimeError("Instance returned an invalid OAuth application response")
+
     with get_db() as db:
         db.execute(
-            "INSERT OR REPLACE INTO oauth_apps (instance, client_id, client_secret) VALUES (?, ?, ?)",
-            (instance, result["client_id"], result["client_secret"]),
+            """
+            INSERT INTO oauth_apps (instance, client_id, client_secret)
+            VALUES (?, ?, ?)
+            ON CONFLICT(instance) DO UPDATE SET
+                client_id = excluded.client_id,
+                client_secret = excluded.client_secret
+            """,
+            (instance, client_id, client_secret),
         )
 
-    return {"client_id": result["client_id"], "client_secret": result["client_secret"]}
+    return {"client_id": client_id, "client_secret": client_secret}
 
 
-def get_authorize_url(instance: str) -> str:
-    """Build the OAuth authorize URL for the instance.
+def get_authorize_url(instance: str, session_binding: str) -> str:
+    """Build a session-bound Mastodon authorization URL."""
+    if not session_binding:
+        raise ValueError("A browser session binding is required")
 
-    The state parameter is HMAC-signed to prevent CSRF and tampering —
-    we embed the instance URL so we know which instance to call back to,
-    and the signature prevents an attacker from forging a state token.
-    """
     instance = instance.rstrip("/")
+    validate_outbound_url(instance)
     app = get_or_create_app(instance)
-    state_token = _sign_state(instance)
-    return (
-        f"{instance}/oauth/authorize"
-        f"?client_id={app['client_id']}"
-        f"&redirect_uri={CALLBACK_URL}"
-        f"&response_type=code"
-        f"&scope={SCOPES.replace(' ', '+')}"
-        f"&state={state_token}"
+    state_token = _sign_state(instance, session_binding)
+
+    query = urlencode(
+        {
+            "client_id": app["client_id"],
+            "redirect_uri": CALLBACK_URL,
+            "response_type": "code",
+            "scope": SCOPES,
+            "state": state_token,
+        }
     )
+    return f"{instance}/oauth/authorize?{query}"
 
 
 def exchange_code(instance: str, code: str) -> dict:
-    """Exchange the OAuth callback code for an access token.
-
-    Returns: {access_token, scope, account_id (Mastodon account ID)}
-    """
+    """Exchange an authorization code for an access token."""
     instance = instance.rstrip("/")
+    validate_outbound_url(instance)
     app = get_or_create_app(instance)
-    url = f"{instance}/oauth/token"
+
     data = {
         "client_id": app["client_id"],
         "client_secret": app["client_secret"],
@@ -140,15 +214,23 @@ def exchange_code(instance: str, code: str) -> dict:
         "code": code,
         "scope": SCOPES,
     }
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(url, data=data)
-        resp.raise_for_status()
-        return resp.json()
+
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=False,
+        ) as client:
+            response = client.post(f"{instance}/oauth/token", data=data)
+            response.raise_for_status()
+            result = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError("OAuth token exchange failed") from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Instance returned an invalid OAuth token response")
+    return result
 
 
-def verify_state(state: str) -> str:
-    """Verify an HMAC-signed state token and return the instance.
-
-    Raises ValueError if the signature is invalid or the token is malformed.
-    """
-    return _verify_state(state)
+def verify_state(state: str, session_binding: str) -> str:
+    """Verify and consume a server-side, one-time OAuth state token."""
+    return _verify_state(state, session_binding)
