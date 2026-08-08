@@ -99,35 +99,54 @@ Sends rendered template content as plain-text email. Reads SMTP config (host, po
 
 ### `templates/` — Jinja2 HTML templates
 
-8 templates: `base.html` (layout + nav), `dashboard.html` (overview stats), `feeds.html`, `accounts.html`, `echoes.html`, `history.html` (post log), `settings.html` (SMTP config), `404.html`. All use Jinja2 autoescaping.
+9 templates: `base.html` (layout + nav), `dashboard.html` (overview stats), `feeds.html`, `accounts.html`, `echoes.html`, `history.html` (post log), `settings.html` (SMTP config), `login.html` (shared-secret auth), `404.html`. All use Jinja2 autoescaping.
 
 ### `static/` — CSS and JavaScript
 
 `style.css` (mobile-responsive, table-to-card at 640px breakpoint) and `app.js` (inline echo editing, account test buttons, feed preview). Vanilla JS, no frameworks, no build step.
 
-### `tests/` — 45 pytest tests
+### `tests/` — 62 pytest tests
 
-Three test modules covering the database layer, feed parser (item detection, HTML stripping, truncation, date parsing), and template engine (variable substitution, date formatting, hashtag generation).
+Four test modules covering the database layer, feed parser (item detection, HTML stripping, truncation, date parsing), template engine (variable substitution, date formatting, hashtag generation), and security features (SSRF protection, OAuth state signing).
 
 ## Security
 
 FeedEcho handles OAuth tokens and posts to your Mastodon accounts. Here's what it does and doesn't do:
 
-### Secrets handling
+### SSRF protection
 
-- **Mastodon OAuth tokens** are stored in the SQLite database (`accounts.access_token`). The database file is local to the server. There is no encryption at rest — if an attacker gains filesystem access, they can read the tokens. This is the same trust model as any self-hosted app with a local database.
-- **SMTP passwords** are stored in the `settings` table in plaintext. Same caveat applies.
-- **OAuth client secrets** (per-instance app credentials) are cached in the `oauth_apps` table. These are less sensitive than user tokens but are stored in plaintext.
-- FeedEcho **does not** log tokens, passwords, or secrets to the application log. Log messages contain echo IDs, feed names, and error messages only.
+Feed URLs are validated before fetching. The SSRF filter blocks:
+- Non-http(s) schemes (`file://`, `gopher://`, etc.)
+- Direct IP addresses in private ranges (10.x, 172.16-31.x, 192.168.x, 127.x, 169.254.x, ::1, fc00::, fe80::)
+- Hostnames that resolve to private/internal IPs (DNS resolution is checked before the request is made)
+
+This prevents a user from pointing FeedEcho at cloud metadata endpoints (`169.254.169.254`), internal services, or localhost.
+
+### Web UI authentication
+
+FeedEcho supports optional shared-secret authentication via the `FEEDCHO_AUTH_TOKEN` environment variable:
+
+- **If set**: all requests must include the token as either a cookie (set by the login page at `/login`) or an `X-Auth-Token` header (for API/programmatic access). Unauthenticated browser requests are redirected to `/login`; API requests get 401.
+- **If unset**: auth is disabled (original behavior). The app is open to anyone who can reach the port.
+
+The OAuth callback endpoints (`/oauth/connect`, `/oauth/callback`) are exempt from auth so Mastodon's redirect flow works without a cookie. The HMAC-signed state token provides CSRF protection on those endpoints.
 
 ### OAuth flow
 
-- The OAuth state parameter includes a cryptographically random token (`secrets.token_urlsafe(16)`) to prevent CSRF during the authorization flow.
-- The callback URL is hardcoded to the deployment's public URL. If you self-host, update `CALLBACK_URL` in `oauth.py` to match your domain.
+- The OAuth state parameter is **HMAC-signed** (`hmac.compare_digest`, SHA-256). Format: `<nonce>|<instance>|<signature>`. The signature covers the nonce and instance, preventing CSRF and tampering with the instance field. A forged state token without the secret is rejected.
+- The callback URL is configurable via the `FEEDCHO_CALLBACK_URL` environment variable. If unset, it defaults to `https://feedecho.snakepit.us/oauth/callback`. Self-hosters should set this to their public URL.
+
+### Secrets handling
+
+- **Mastodon OAuth tokens** are stored in the SQLite database (`accounts.access_token`). The database file is local to the server. There is no encryption at rest — if an attacker gains filesystem access, they can read the tokens.
+- **SMTP passwords** are stored in the `settings` table in plaintext. They are **masked** (`********`) when sent to the browser on the settings and accounts pages. The save endpoint skips password updates when the mask placeholder is submitted, so the existing password is preserved.
+- **OAuth client secrets** (per-instance app credentials) are cached in the `oauth_apps` table in plaintext.
+- FeedEcho **does not** log tokens, passwords, or secrets to the application log. Log messages contain echo IDs, feed names, and error messages only.
+- The `FEEDCHO_AUTH_TOKEN` env var doubles as the HMAC signing key for OAuth state tokens if set, so a single secret secures both layers.
 
 ### Input handling
 
-- Feed content from external RSS/Atom/JSON feeds is treated as untrusted. HTML is stripped to plain text before posting to Mastodon (Mastodon statuses are plain text). Feed item titles and URLs are never rendered as HTML in the UI without Jinja2 autoescaping.
+- Feed content from external RSS/Atom/JSON feeds is treated as untrusted. HTML is stripped to plain text before posting to Mastodon. Feed item titles and URLs are never rendered as HTML in the UI without Jinja2 autoescaping.
 - Template variables are substituted via regex — there is no `eval()` or code execution path. A malformed template produces empty or garbled output, not a security hole.
 - Feed fetches are capped at 10 MB to prevent memory exhaustion from hostile feeds.
 - The inline echo editor in `app.js` stores original row HTML in an in-memory Map rather than serializing it into a DOM attribute, avoiding an XSS vector that was present in an earlier version.
@@ -135,12 +154,19 @@ FeedEcho handles OAuth tokens and posts to your Mastodon accounts. Here's what i
 ### Network
 
 - All outbound HTTP uses httpx with a 30-second timeout. FeedEcho makes requests to: the feed URL (user-provided), the Mastodon instance API (user-provided), and the SMTP server (admin-configured). No telemetry, no phone-home, no analytics.
-- There is no authentication on the web UI. FeedEcho is designed to run behind a reverse proxy or tunnel (Cloudflare Tunnel, nginx, etc.) with access control at the network layer. If you expose the port directly to the internet, anyone who can reach it can manage your feeds and post to your accounts.
+- Even without `FEEDCHO_AUTH_TOKEN`, FeedEcho is designed to run behind a reverse proxy or tunnel (Cloudflare Tunnel, nginx, etc.) with access control at the network layer. The built-in auth is a lightweight fallback for when a reverse proxy isn't available.
+
+### Configuration
+
+| Environment variable | Purpose | Default |
+|---------------------|---------|---------|
+| `FEEDCHO_AUTH_TOKEN` | Shared-secret auth token (enables login page + API auth, also signs OAuth state) | Unset (auth disabled) |
+| `FEEDCHO_CALLBACK_URL` | Public URL for OAuth callback | `https://feedecho.snakepit.us/oauth/callback` |
+| `FEEDCHO_DB_PATH` | Path to SQLite database | `./feedecho.db` |
 
 ### What FeedEcho does NOT do
 
-- Does not encrypt secrets at rest
-- Does not require authentication on the web UI
+- Does not encrypt secrets at rest (tokens and passwords are plaintext in SQLite)
 - Does not rate-limit its own feed polling (relies on APScheduler intervals)
 - Does not validate SSL certificates beyond httpx defaults
 - Does not sandbox feed parsing (feedparser runs in-process)
@@ -187,7 +213,12 @@ ingress:
 EOF
 ```
 
-If using OAuth, update `CALLBACK_URL` in `oauth.py` to match your public URL.
+If using OAuth, set `FEEDCHO_CALLBACK_URL` to your public URL:
+
+```bash
+export FEEDCHO_CALLBACK_URL="https://feedecho.yourdomain.com/oauth/callback"
+export FEEDCHO_AUTH_TOKEN="your-secret-token"  # optional: enable web UI auth
+```
 
 ## Testing
 
@@ -200,17 +231,17 @@ python -m pytest tests/ -v
 
 ```
 feedecho/
-├── app.py              # FastAPI app — routes, templates, OAuth callbacks
+├── app.py              # FastAPI app — routes, auth middleware, OAuth callbacks
 ├── database.py         # SQLite layer (7 tables)
-├── feed_parser.py     # RSS/Atom/JSON feed fetching + parsing
+├── feed_parser.py     # RSS/Atom/JSON feed fetching + SSRF protection
 ├── mastodon.py        # Mastodon API client
-├── oauth.py           # Mastodon OAuth 2.0 flow
+├── oauth.py           # Mastodon OAuth 2.0 flow (HMAC-signed state)
 ├── scheduler.py       # APScheduler background feed checker
 ├── template_engine.py # Variable substitution
 ├── email_sender.py    # SMTP email dispatch
-├── templates/         # Jinja2 HTML templates
+├── templates/         # Jinja2 HTML templates (9)
 ├── static/            # CSS + JS
-└── tests/             # 45 tests (pytest)
+└── tests/             # 62 tests (pytest)
 ```
 
 ## License

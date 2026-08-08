@@ -7,26 +7,28 @@ feeds, accounts, echoes, settings, and viewing post history.
 import os
 import re
 import logging
+import secrets as _secrets
 from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from database import get_db, init_db
-from feed_parser import fetch_feed
+from feed_parser import fetch_feed, SSRFError
 from mastodon import test_connection, post_status, verify_credentials
 from template_engine import render_template, available_variables
 from scheduler import start_scheduler, stop_scheduler, check_feed
-from oauth import get_authorize_url, exchange_code, parse_state
+from oauth import get_authorize_url, exchange_code, verify_state
 from email_sender import get_smtp_settings, test_smtp_connection
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
 
-app = FastAPI(title="FeedEcho", version="0.2.0")
+app = FastAPI(title="FeedEcho", version="1.0.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -35,6 +37,81 @@ jinja = Environment(
     loader=FileSystemLoader(BASE_DIR / "templates"),
     autoescape=select_autoescape(["html"]),
 )
+
+# ── Optional shared-secret auth ──────────────────────────────────────────────
+# If FEEDCHO_AUTH_TOKEN is set, all requests must include it as either:
+#   - Cookie: feedecho_auth=<token>   (set by the login page)
+#   - X-Auth-Token: <token>           (for API/programmatic access)
+# If the env var is unset, auth is disabled (original behavior).
+_AUTH_TOKEN = os.environ.get("FEEDCHO_AUTH_TOKEN")
+
+# Paths exempt from auth: health check + static files + OAuth callback
+# (OAuth callback needs to work without a cookie since the user is redirected
+# back from Mastodon; the HMAC-signed state token provides CSRF protection).
+_AUTH_EXEMPT_PATHS = {"/healthz", "/favicon.svg", "/static", "/oauth/callback", "/oauth/connect"}
+_AUTH_EXEMPT_PREFIXES = ("/static",)
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Shared-secret auth. If FEEDCHO_AUTH_TOKEN is unset, this is a no-op."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not _AUTH_TOKEN:
+            return await call_next(request)
+
+        path = request.url.path
+
+        # Allow health check and static files without auth
+        if path in _AUTH_EXEMPT_PATHS or path.startswith(tuple(_AUTH_EXEMPT_PREFIXES)):
+            return await call_next(request)
+
+        # Check cookie or header
+        token = (
+            request.cookies.get("feedecho_auth")
+            or request.headers.get("x-auth-token")
+        )
+
+        if token and _secrets.compare_digest(token, _AUTH_TOKEN):
+            return await call_next(request)
+
+        # If this is the login endpoint, let it through
+        if path == "/login":
+            return await call_next(request)
+
+        # Redirect browser requests to login, 401 for API/JSON
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept and request.method == "GET":
+            return RedirectResponse(url="/login", status_code=302)
+        return JSONResponse(
+            {"detail": "Authentication required"}, status_code=401
+        )
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if not _AUTH_TOKEN:
+        return RedirectResponse(url="/", status_code=302)
+    return render("login.html", request)
+
+
+@app.post("/login")
+async def login_submit(request: Request, token: str = Form(...)):
+    if not _AUTH_TOKEN:
+        return RedirectResponse(url="/", status_code=302)
+    if _secrets.compare_digest(token, _AUTH_TOKEN):
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key="feedecho_auth",
+            value=token,
+            httponly=True,
+            samesite="lax",
+            secure=request.url.scheme == "https",
+        )
+        return response
+    return render("login.html", request, error="Invalid token")
+
+
+app.add_middleware(AuthMiddleware)
 
 
 def render(name: str, request: Request, status_code: int = 200, **kwargs) -> HTMLResponse:
@@ -66,15 +143,22 @@ app.router.lifespan_context = lifespan
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _get_smtp_settings():
-    """Load SMTP settings as a flat dict for templates."""
+def _get_smtp_settings(mask_password: bool = False):
+    """Load SMTP settings as a flat dict for templates.
+
+    If mask_password is True, replaces the SMTP password with a placeholder
+    so it's never sent to the browser. Used on settings/accounts pages.
+    """
     with get_db() as db:
         rows = db.execute(
             "SELECT key, value FROM settings WHERE key LIKE 'smtp_%'"
         ).fetchall()
     if not rows:
         return {}
-    return {row["key"]: row["value"] for row in rows}
+    settings = {row["key"]: row["value"] for row in rows}
+    if mask_password and settings.get("smtp_password"):
+        settings["smtp_password"] = "********"
+    return settings
 
 
 def _get_all_accounts():
@@ -150,7 +234,7 @@ async def feeds_page(request: Request):
 @app.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request):
     mastodon_accounts, email_accounts = _get_all_accounts()
-    smtp_settings = _get_smtp_settings()
+    smtp_settings = _get_smtp_settings(mask_password=True)
     smtp_configured = bool(smtp_settings.get("smtp_host"))
     return render("accounts.html", request,
                   mastodon_accounts=mastodon_accounts,
@@ -213,7 +297,7 @@ async def history_page(request: Request):
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
-    smtp_settings = _get_smtp_settings()
+    smtp_settings = _get_smtp_settings(mask_password=True)
     smtp_configured = bool(smtp_settings.get("smtp_host"))
     return render("settings.html", request,
                   smtp_settings=smtp_settings,
@@ -298,7 +382,6 @@ async def save_smtp_settings(
         "smtp_host": smtp_host,
         "smtp_port": str(smtp_port),
         "smtp_username": smtp_username,
-        "smtp_password": smtp_password,
         "smtp_from_email": smtp_from_email,
         "smtp_from_name": smtp_from_name,
         "smtp_use_tls": smtp_use_tls,
@@ -308,6 +391,12 @@ async def save_smtp_settings(
             db.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (key, value),
+            )
+        # Only update password if it's not the mask placeholder
+        if smtp_password and smtp_password != "********":
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("smtp_password", smtp_password),
             )
     return RedirectResponse(url="/settings?status=saved", status_code=303)
 
@@ -361,6 +450,8 @@ async def test_feed(feed_id: int):
             "items": feed_data["items"][:5],
         }
         return {"success": True, "preview": preview}
+    except SSRFError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -379,6 +470,8 @@ async def init_feed(feed_id: int):
                 db.execute("UPDATE feeds SET last_item_id = ? WHERE id = ?", (last_id, feed_id))
                 return {"success": True, "message": f"Initialized. Last item: {feed_data['items'][0]['title'][:60]}"}
             return {"success": True, "message": "Feed has no items"}
+        except SSRFError as e:
+            return {"success": False, "error": str(e)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -389,6 +482,8 @@ async def fetch_now(feed_id: int):
     try:
         check_feed(feed_id)
         return {"success": True, "message": "Feed checked"}
+    except SSRFError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -509,6 +604,8 @@ async def preview_template(
         item = feed_data["items"][0]
         rendered = render_template(template, item)
         return {"success": True, "rendered": rendered, "item_title": item["title"]}
+    except SSRFError as e:
+        return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -522,7 +619,7 @@ async def oauth_connect(request: Request, instance: str = ""):
         raise HTTPException(status_code=400, detail="Instance URL is required")
     instance = validate_url(instance)
     try:
-        auth_url = get_authorize_url(instance, "")
+        auth_url = get_authorize_url(instance)
         return RedirectResponse(url=auth_url)
     except Exception as e:
         logger.error(f"OAuth connect failed for {instance}: {e}")
@@ -549,7 +646,7 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
         raise HTTPException(status_code=400, detail="Missing code or state parameter")
 
     try:
-        _, instance = parse_state(state)
+        instance = verify_state(state)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid state parameter")
 

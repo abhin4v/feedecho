@@ -7,21 +7,97 @@ author, date, and raw data for template access.
 import re
 import hashlib
 import html
+import ipaddress
+import socket
 import httpx
 import feedparser
 from datetime import datetime, timezone
 from time import mktime
+from urllib.parse import urlparse
 
 
-USER_AGENT = "feedecho/0.1 (+https://github.com/jcrabapple)"
+USER_AGENT = "feedecho/1.0 (+https://github.com/jcrabapple)"
 MAX_FEED_SIZE = 10 * 1024 * 1024  # 10 MB cap
+
+
+class SSRFError(ValueError):
+    """Raised when a feed URL points to a private or internal address."""
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Check if an IP address is private, loopback, link-local, or reserved."""
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def validate_feed_url(url: str) -> str:
+    """Validate that a feed URL is safe to fetch (SSRF protection).
+
+    Blocks:
+    - Non-http(s) schemes (file://, gopher://, etc.)
+    - Hostnames that resolve to private/internal IPs
+    - Direct IP addresses in private ranges (10.x, 172.16-31.x, 192.168.x,
+      127.x, 169.254.x, ::1, fc00::, fe80::)
+
+    Raises SSRFError if the URL is unsafe. Returns the URL if safe.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFError(f"Blocked: URL scheme '{parsed.scheme}' is not allowed")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise SSRFError("Blocked: URL has no hostname")
+
+    # If it's a literal IP, check directly
+    is_ip = False
+    ip = None
+    try:
+        ip = ipaddress.ip_address(hostname)
+        is_ip = True
+    except ValueError:
+        pass
+
+    if is_ip and ip is not None:
+        if _is_blocked_ip(ip):
+            raise SSRFError(f"Blocked: IP address {ip} is in a private/reserved range")
+    else:
+        # Not a literal IP — resolve the hostname and check all results
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            raise SSRFError(f"Blocked: cannot resolve hostname '{hostname}'")
+
+        for family, _, _, _, sockaddr in infos:
+            addr_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(addr_str)
+            except ValueError:
+                continue
+            if _is_blocked_ip(ip):
+                raise SSRFError(
+                    f"Blocked: hostname '{hostname}' resolves to "
+                    f"private/reserved IP {ip}"
+                )
+
+    return url
 
 
 def fetch_feed(url: str) -> dict:
     """Fetch and parse a feed URL. Returns dict with feed metadata and items.
 
+    Raises SSRFError if the URL points to a private/internal address.
     Raises httpx.HTTPError on network failure.
     """
+    validate_feed_url(url)
+
     headers = {"User-Agent": USER_AGENT}
     with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
         response = client.get(url)

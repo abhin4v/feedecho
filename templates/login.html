@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Login — FeedEcho{% endblock %}
+{% block content %}
+<div class="auth-container">
+    <div class="auth-card">
+        <h1>FeedEcho</h1>
+        <p class="auth-subtitle">Enter your access token to continue.</p>
+        {% if error %}
+        <div class="alert alert-error">{{ error }}</div>
+        {% endif %}
+        <form method="post" action="/login" class="auth-form">
+            <div class="form-row">
+                <input type="password" name="token" placeholder="Access token" required
+                       autocomplete="off" autofocus class="auth-input">
+            </div>
+            <button type="submit" class="btn">Log in</button>
+        </form>
+    </div>
+</div>
+{% endblock %}
