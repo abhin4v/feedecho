@@ -2,6 +2,7 @@
 
 import httpx
 from typing import Optional
+from feed_parser import validate_outbound_url
 
 
 def post_status(
@@ -27,6 +28,7 @@ def post_status(
         httpx.HTTPStatusError on API failure.
     """
     instance = instance.rstrip("/")
+    validate_outbound_url(instance)
     url = f"{instance}/api/v1/statuses"
     headers = {"Authorization": f"Bearer {access_token}"}
     data = {
@@ -47,6 +49,7 @@ def verify_credentials(instance: str, access_token: str) -> dict:
     Returns dict with 'username', 'display_name', 'url' on success.
     """
     instance = instance.rstrip("/")
+    validate_outbound_url(instance)
     url = f"{instance}/api/v1/accounts/verify_credentials"
     headers = {"Authorization": f"Bearer {access_token}"}
 

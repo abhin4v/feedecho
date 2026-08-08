@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from database import get_db, init_db
-from feed_parser import fetch_feed, SSRFError
+from feed_parser import fetch_feed, SSRFError, validate_outbound_url
 from mastodon import test_connection, post_status, verify_credentials
 from template_engine import render_template, available_variables
 from scheduler import start_scheduler, stop_scheduler, check_feed
@@ -45,10 +45,11 @@ jinja = Environment(
 # If the env var is unset, auth is disabled (original behavior).
 _AUTH_TOKEN = os.environ.get("FEEDCHO_AUTH_TOKEN")
 
-# Paths exempt from auth: health check + static files + OAuth callback
-# (OAuth callback needs to work without a cookie since the user is redirected
-# back from Mastodon; the HMAC-signed state token provides CSRF protection).
-_AUTH_EXEMPT_PATHS = {"/healthz", "/favicon.svg", "/static", "/oauth/callback", "/oauth/connect"}
+# Paths exempt from auth: health check + static files + OAuth callback.
+# Only /oauth/callback must be reachable without a cookie (Mastodon redirects
+# the user's browser here). /oauth/connect requires auth so unauthenticated
+# users cannot trigger outbound requests to arbitrary instance URLs.
+_AUTH_EXEMPT_PATHS = {"/healthz", "/favicon.svg", "/static", "/oauth/callback"}
 _AUTH_EXEMPT_PREFIXES = ("/static",)
 
 
@@ -120,9 +121,17 @@ def render(name: str, request: Request, status_code: int = 200, **kwargs) -> HTM
 
 
 def validate_url(url: str) -> str:
-    """Validate a URL has http or https scheme."""
+    """Validate a URL has http or https scheme and is safe for outbound requests.
+
+    Combines scheme check with SSRF protection (blocks private IPs,
+    internal hostnames, non-http schemes, embedded credentials).
+    """
     if not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    try:
+        validate_outbound_url(url)
+    except SSRFError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return url.rstrip("/")
 
 

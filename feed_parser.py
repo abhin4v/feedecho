@@ -18,10 +18,11 @@ from urllib.parse import urlparse
 
 USER_AGENT = "feedecho/1.0 (+https://github.com/jcrabapple)"
 MAX_FEED_SIZE = 10 * 1024 * 1024  # 10 MB cap
+MAX_REDIRECTS = 5
 
 
 class SSRFError(ValueError):
-    """Raised when a feed URL points to a private or internal address."""
+    """Raised when a URL points to a private or internal address."""
 
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -36,11 +37,12 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
-def validate_feed_url(url: str) -> str:
-    """Validate that a feed URL is safe to fetch (SSRF protection).
+def validate_outbound_url(url: str) -> str:
+    """Validate that a URL is safe for server-side fetching (SSRF protection).
 
     Blocks:
     - Non-http(s) schemes (file://, gopher://, etc.)
+    - Userinfo in URL (user:pass@host)
     - Hostnames that resolve to private/internal IPs
     - Direct IP addresses in private ranges (10.x, 172.16-31.x, 192.168.x,
       127.x, 169.254.x, ::1, fc00::, fe80::)
@@ -51,6 +53,9 @@ def validate_feed_url(url: str) -> str:
 
     if parsed.scheme not in ("http", "https"):
         raise SSRFError(f"Blocked: URL scheme '{parsed.scheme}' is not allowed")
+
+    if parsed.username or parsed.password:
+        raise SSRFError("Blocked: URLs with embedded credentials are not allowed")
 
     hostname = parsed.hostname
     if not hostname:
@@ -90,18 +95,23 @@ def validate_feed_url(url: str) -> str:
     return url
 
 
+# Backwards-compatible alias
+validate_feed_url = validate_outbound_url
+
+
 def fetch_feed(url: str) -> dict:
     """Fetch and parse a feed URL. Returns dict with feed metadata and items.
 
-    Raises SSRFError if the URL points to a private/internal address.
+    Validates the initial URL and every redirect hop for SSRF protection.
+    Raises SSRFError if any URL (initial or redirect) points to a
+    private/internal address.
     Raises httpx.HTTPError on network failure.
     """
-    validate_feed_url(url)
+    validate_outbound_url(url)
 
     headers = {"User-Agent": USER_AGENT}
-    with httpx.Client(headers=headers, follow_redirects=True, timeout=30) as client:
-        response = client.get(url)
-        response.raise_for_status()
+    with httpx.Client(headers=headers, follow_redirects=False, timeout=30) as client:
+        response = _fetch_with_redirect_validation(client, url, headers)
         content_type = response.headers.get("content-type", "")
 
     # Cap feed size to prevent OOM from hostile feeds
@@ -115,6 +125,33 @@ def fetch_feed(url: str) -> dict:
     # RSS/Atom via feedparser
     parsed = feedparser.parse(response.content)
     return parse_rss_feed(parsed, url)
+
+
+def _fetch_with_redirect_validation(
+    client: httpx.Client, url: str, headers: dict
+) -> httpx.Response:
+    """Fetch a URL, manually following redirects while validating each hop.
+
+    Prevents SSRF via redirect: an attacker can host a public feed that
+    redirects to an internal IP. This function validates every Location
+    header before following it.
+    """
+    for _ in range(MAX_REDIRECTS + 1):
+        response = client.get(url, headers=headers)
+
+        if not response.is_redirect:
+            response.raise_for_status()
+            return response
+
+        location = response.headers.get("location")
+        if not location:
+            raise ValueError("Redirect response had no Location header")
+
+        # Resolve relative redirects against the current URL
+        url = str(httpx.URL(url).join(location))
+        validate_outbound_url(url)
+
+    raise ValueError(f"Too many redirects (max {MAX_REDIRECTS})")
 
 
 def parse_rss_feed(parsed: feedparser.FeedParserDict, url: str) -> dict:

@@ -15,6 +15,7 @@ import hashlib
 import os
 import secrets
 from database import get_db
+from feed_parser import validate_outbound_url, SSRFError
 
 # The public URL that Mastodon will redirect back to.
 # Configurable via FEEDCHO_CALLBACK_URL env var so self-hosters don't edit source.
@@ -69,6 +70,7 @@ def get_or_create_app(instance: str) -> dict:
     Returns: {client_id, client_secret}
     """
     instance = instance.rstrip("/")
+    validate_outbound_url(instance)
 
     # Check cache first
     with get_db() as db:
