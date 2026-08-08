@@ -69,11 +69,11 @@ class TestEchoes:
         with get_db() as db:
             db.execute(
                 "INSERT INTO email_accounts (name, email) VALUES (?, ?)",
-                ("Jason", "jason@example.com"),
+                ("Test User", "user@example.com"),
             )
             rows = db.execute("SELECT * FROM email_accounts").fetchall()
             assert len(rows) == 1
-            assert rows[0]["email"] == "jason@example.com"
+            assert rows[0]["email"] == "user@example.com"
 
     def test_settings_crud(self, temp_db):
         with get_db() as db:
