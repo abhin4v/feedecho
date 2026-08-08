@@ -16,7 +16,7 @@ from time import mktime
 from urllib.parse import urlparse
 
 
-USER_AGENT = "feedecho/1.0 (+https://github.com/jcrabapple)"
+USER_AGENT = "feedecho/1.0 (+https://github.com/yourusername/feedecho)"
 MAX_FEED_SIZE = 10 * 1024 * 1024  # 10 MB cap
 MAX_REDIRECTS = 5
 

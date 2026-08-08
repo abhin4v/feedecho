@@ -16,7 +16,7 @@ from feed_parser import SSRFError, validate_outbound_url
 
 CALLBACK_URL = os.environ.get(
     "FEEDCHO_CALLBACK_URL",
-    "https://feedecho.snakepit.us/oauth/callback",
+    "https://feedecho.example.com/oauth/callback",
 )
 SCOPES = "read write"
 STATE_TTL_SECONDS = 10 * 60
@@ -144,7 +144,7 @@ def get_or_create_app(instance: str) -> dict:
         "client_name": "FeedEcho",
         "redirect_uris": CALLBACK_URL,
         "scopes": SCOPES,
-        "website": "https://feedecho.snakepit.us",
+        "website": "https://feedecho.example.com",
     }
 
     try:

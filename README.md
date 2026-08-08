@@ -30,7 +30,7 @@ Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echo
 ## Quick Start
 
 ```bash
-git clone https://github.com/jcrabapple/feedecho.git
+git clone https://github.com/yourusername/feedecho.git
 cd feedecho
 python -m venv .venv
 source .venv/bin/activate
@@ -134,7 +134,7 @@ The OAuth callback endpoints (`/oauth/connect`, `/oauth/callback`) are exempt fr
 ### OAuth flow
 
 - The OAuth state parameter is **HMAC-signed** (`hmac.compare_digest`, SHA-256). Format: `<nonce>|<instance>|<signature>`. The signature covers the nonce and instance, preventing CSRF and tampering with the instance field. A forged state token without the secret is rejected.
-- The callback URL is configurable via the `FEEDCHO_CALLBACK_URL` environment variable. If unset, it defaults to `https://feedecho.snakepit.us/oauth/callback`. Self-hosters should set this to their public URL.
+- The callback URL is configurable via the `FEEDCHO_CALLBACK_URL` environment variable. If unset, it defaults to `https://feedecho.example.com/oauth/callback`. Self-hosters should set this to their public URL.
 
 ### Secrets handling
 
@@ -161,7 +161,7 @@ The OAuth callback endpoints (`/oauth/connect`, `/oauth/callback`) are exempt fr
 | Environment variable | Purpose | Default |
 |---------------------|---------|---------|
 | `FEEDCHO_AUTH_TOKEN` | Shared-secret auth token (enables login page + API auth, also signs OAuth state) | Unset (auth disabled) |
-| `FEEDCHO_CALLBACK_URL` | Public URL for OAuth callback | `https://feedecho.snakepit.us/oauth/callback` |
+| `FEEDCHO_CALLBACK_URL` | Public URL for OAuth callback | `https://feedecho.example.com/oauth/callback` |
 | `FEEDCHO_DB_PATH` | Path to SQLite database | `./feedecho.db` |
 
 ### What FeedEcho does NOT do
@@ -185,8 +185,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/projects/feedecho
-ExecStart=%h/projects/feedecho/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8453
+WorkingDirectory=%h/feedecho
+ExecStart=%h/feedecho/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8453
 Restart=on-failure
 RestartSec=5
 
@@ -204,7 +204,7 @@ cloudflared tunnel route dns <TUNNEL_ID> feedecho.yourdomain.com
 
 cat > ~/.cloudflared/feedecho.yml << 'EOF'
 tunnel: feedecho
-credentials-file: /home/jason/.cloudflared/<TUNNEL_ID>.json
+credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
   - hostname: feedecho.yourdomain.com
