@@ -28,7 +28,8 @@
     <details>
         <summary>Or add Mastodon manually with a token</summary>
         <form method="post" action="/api/accounts" class="inline-form" style="margin-top: 0.75rem;">
-            <input type="text" name="name" placeholder="Account name" required>
+            <input type="text" name="name" placeholder="Display name" required>
+            <input type="text" name="username" placeholder="Username">
             <input type="url" name="instance" placeholder="https://dmv.community" required>
             <input type="password" name="access_token" placeholder="Access token" required>
             <button type="submit">Add Account</button>
@@ -50,29 +51,31 @@
 <h2>Mastodon Accounts</h2>
 <div class="data-table-wrapper">
 <table class="data-table">
-    <thead>
-        <tr>
-            <th>Name</th>
-            <th>Instance</th>
-            <th>Added</th>
-            <th>Actions</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for account in mastodon_accounts %}
-        <tr>
-            <td data-label="Name">{{ account.name }}</td>
-            <td data-label="Instance">{{ account.instance }}</td>
-            <td data-label="Added"><small>{{ account.created_at }}</small></td>
-            <td data-label="Actions" class="action-cell">
-                <button class="btn-sm" onclick="testAccount({{ account.id }})">Test</button>
-                <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
-                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account?')">Delete</button>
-                </form>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
+<thead>
+    <tr>
+        <th>Handle</th>
+        <th>Name</th>
+        <th>Instance</th>
+        <th>Added</th>
+        <th>Actions</th>
+    </tr>
+</thead>
+<tbody>
+    {% for account in mastodon_accounts %}
+    <tr>
+        <td data-label="Handle"><code>@{{ account.username }}@{{ account.instance | replace('https://', '') }}</code></td>
+        <td data-label="Name">{{ account.name }}</td>
+        <td data-label="Instance">{{ account.instance }}</td>
+        <td data-label="Added"><small>{{ account.created_at }}</small></td>
+        <td data-label="Actions" class="action-cell">
+            <button class="btn-sm" onclick="testAccount({{ account.id }})">Test</button>
+            <form method="post" action="/api/accounts/{{ account.id }}/delete" class="inline">
+                <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account?')">Delete</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</tbody>
 </table>
 </div>
 {% endif %}

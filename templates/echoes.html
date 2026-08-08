@@ -29,7 +29,7 @@
         <label>Mastodon Account
             <select name="account_id">
                 {% for account in mastodon_accounts %}
-                <option value="{{ account.id }}">{{ account.name }} ({{ account.instance }})</option>
+                <option value="{{ account.id }}">@{{ account.username }}@{{ account.instance | replace('https://', '') }}</option>
                 {% endfor %}
             </select>
         </label>
@@ -83,7 +83,6 @@
         <tr>
             <th>Feed</th>
             <th>Destination</th>
-            <th>Template</th>
             <th>Visibility</th>
             <th>Status</th>
             <th>Actions</th>
@@ -101,12 +100,11 @@
             <td data-label="Feed">{{ echo.feed_name }}</td>
             <td data-label="Destination">
                 {% if echo.destination_type == 'mastodon' %}
-                <span class="badge badge-success">Mastodon</span> {{ echo.destination_name }}
+                <span class="badge badge-success">Mastodon</span> <code>{{ echo.destination_name }}</code>
                 {% elif echo.destination_type == 'email' %}
                 <span class="badge badge-success">Email</span> {{ echo.destination_name }}
                 {% endif %}
             </td>
-            <td data-label="Template"><code>{{ echo.template[:60] }}{% if echo.template|length > 60 %}…{% endif %}</code></td>
             <td data-label="Visibility">{{ echo.visibility }}</td>
             <td data-label="Status">
                 {% if echo.enabled %}
@@ -136,7 +134,7 @@
     {% for feed in feeds %}<option value="{{ feed.id }}">{{ feed.name }}</option>{% endfor %}
 </script>
 <script id="mastodon-options" type="text/html">
-    {% for a in mastodon_accounts %}<option value="{{ a.id }}">{{ a.name }} ({{ a.instance }})</option>{% endfor %}
+    {% for a in mastodon_accounts %}<option value="{{ a.id }}">@{{ a.username }}@{{ a.instance | replace('https://', '') }}</option>{% endfor %}
 </script>
 <script id="email-options" type="text/html">
     {% for a in email_accounts %}<option value="{{ a.id }}">{{ a.name }} ({{ a.email }})</option>{% endfor %}

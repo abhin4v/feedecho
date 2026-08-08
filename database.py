@@ -22,11 +22,25 @@ def init_db():
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                username TEXT DEFAULT '',
                 instance TEXT NOT NULL,
                 access_token TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migration: add username column if missing, populate from existing names
+        cols = db.execute("PRAGMA table_info(accounts)").fetchall()
+        col_names = [c["name"] for c in cols]
+        if "username" not in col_names:
+            db.execute("ALTER TABLE accounts ADD COLUMN username TEXT DEFAULT ''")
+            rows = db.execute("SELECT id, name FROM accounts").fetchall()
+            import re
+            for row in rows:
+                m = re.search(r'\(([^)]+)\)$', row["name"] or "")
+                if m:
+                    db.execute("UPDATE accounts SET username = ? WHERE id = ?", (m.group(1), row["id"]))
+                else:
+                    db.execute("UPDATE accounts SET username = ? WHERE id = ?", (row["name"] or "unknown", row["id"]))
         db.execute("""
             CREATE TABLE IF NOT EXISTS feeds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

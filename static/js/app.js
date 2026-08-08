@@ -79,7 +79,7 @@ function editEcho(echoId) {
     const mastoStyle = destType === 'mastodon' ? '' : 'display:none';
     const emailStyle = destType === 'email' ? '' : 'display:none';
 
-    row.innerHTML = `<td colspan="6">
+    row.innerHTML = `<td colspan="5">
         <form method="post" action="/api/echoes/${echoId}/edit" class="echo-edit-form">
             <div class="form-row">
                 <label>Feed

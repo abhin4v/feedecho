@@ -81,7 +81,7 @@ def _get_all_accounts():
     """Fetch both Mastodon and email accounts."""
     with get_db() as db:
         mastodon = db.execute(
-            "SELECT id, name, instance, created_at FROM accounts ORDER BY name"
+            "SELECT id, name, username, instance, created_at FROM accounts ORDER BY name"
         ).fetchall()
         email = db.execute(
             "SELECT id, name, email, created_at FROM email_accounts ORDER BY name"
@@ -104,7 +104,7 @@ async def dashboard(request: Request):
         echoes = db.execute("""
             SELECT e.*, f.name as feed_name,
                    CASE
-                     WHEN e.destination_type = 'mastodon' THEN a.name || ' (' || a.instance || ')'
+                     WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
                      WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
                    END as destination_name
             FROM echoes e
@@ -114,7 +114,8 @@ async def dashboard(request: Request):
             ORDER BY e.created_at DESC
         """).fetchall()
         recent_posts = db.execute("""
-            SELECT pi.*, f.name as feed_name, a.name as account_name, a.instance
+            SELECT pi.*, f.name as feed_name,
+                   '@' || a.username || '@' || REPLACE(a.instance, 'https://', '') as account_name, a.instance
             FROM posted_items pi
             JOIN echoes e ON pi.echo_id = e.id
             JOIN feeds f ON e.feed_id = f.id
@@ -154,7 +155,8 @@ async def accounts_page(request: Request):
     return render("accounts.html", request,
                   mastodon_accounts=mastodon_accounts,
                   email_accounts=email_accounts,
-                  smtp_configured=smtp_configured)
+                  smtp_configured=smtp_configured,
+                  smtp_settings=smtp_settings)
 
 
 @app.get("/echoes", response_class=HTMLResponse)
@@ -163,8 +165,8 @@ async def echoes_page(request: Request):
         echoes = db.execute("""
             SELECT e.*, f.name as feed_name,
                    CASE
-                     WHEN e.destination_type = 'mastodon' THEN a.name
-                     WHEN e.destination_type = 'email' THEN ea.name
+                     WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
+                     WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
                    END as destination_name
             FROM echoes e
             JOIN feeds f ON e.feed_id = f.id
@@ -174,7 +176,7 @@ async def echoes_page(request: Request):
         """).fetchall()
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
         mastodon_accounts = db.execute(
-            "SELECT id, name, instance FROM accounts ORDER BY name"
+            "SELECT id, name, username, instance FROM accounts ORDER BY name"
         ).fetchall()
         email_accounts = db.execute(
             "SELECT id, name, email FROM email_accounts ORDER BY name"
@@ -191,7 +193,7 @@ async def history_page(request: Request):
         posts = db.execute("""
             SELECT pi.*, f.name as feed_name,
                    CASE
-                     WHEN e.destination_type = 'mastodon' THEN a.name
+                     WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
                      WHEN e.destination_type = 'email' THEN ea.name
                    END as account_name,
                    CASE
@@ -228,14 +230,15 @@ async def healthz():
 @app.post("/api/accounts")
 async def add_account(
     name: str = Form(...),
+    username: str = Form(""),
     instance: str = Form(...),
     access_token: str = Form(...),
 ):
     instance = validate_url(instance)
     with get_db() as db:
         db.execute(
-            "INSERT INTO accounts (name, instance, access_token) VALUES (?, ?, ?)",
-            (name, instance, access_token),
+            "INSERT INTO accounts (name, username, instance, access_token) VALUES (?, ?, ?, ?)",
+            (name, username or name, instance, access_token),
         )
     return RedirectResponse(url="/accounts", status_code=303)
 
@@ -572,17 +575,17 @@ async def oauth_callback(request: Request, code: str = "", state: str = "", erro
 
     try:
         creds = verify_credentials(instance, access_token)
-        name = creds.get("display_name") or creds.get("username", "Unknown")
+        display_name = creds.get("display_name") or creds.get("username", "Unknown")
         username = creds.get("username", "unknown")
     except Exception:
-        name = "Unknown"
+        display_name = "Unknown"
         username = "unknown"
 
     with get_db() as db:
         db.execute(
-            """INSERT OR REPLACE INTO accounts (name, instance, access_token)
-               VALUES (?, ?, ?)""",
-            (f"{name} ({username})", instance, access_token),
+            """INSERT OR REPLACE INTO accounts (name, username, instance, access_token)
+               VALUES (?, ?, ?, ?)""",
+            (display_name, username, instance, access_token),
         )
 
     return RedirectResponse(url="/accounts?status=connected", status_code=303)
