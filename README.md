@@ -115,7 +115,7 @@ feedecho/
 ├── template_engine.py # Variable substitution
 ├── templates/         # Jinja2 HTML templates
 ├── static/            # CSS + JS
-└── tests/             # 43 tests (pytest)
+└── tests/             # 45 tests (pytest)
 ```
 
 ## Testing
