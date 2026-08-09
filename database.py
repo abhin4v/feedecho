@@ -118,6 +118,10 @@ def init_db() -> None:
                 FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
             )
         """)
+        _add_column_if_missing(db, "echoes", "filter_keywords", "TEXT DEFAULT ''")
+        _add_column_if_missing(
+            db, "echoes", "filter_mode", "TEXT NOT NULL DEFAULT 'exclude'"
+        )
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS email_accounts (

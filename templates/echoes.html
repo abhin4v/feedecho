@@ -61,6 +61,18 @@
             <textarea name="template" rows="3" placeholder="{{ title }} {{ link }}">{{ '{{ title }} {{ link }}' }}</textarea>
         </label>
     </div>
+    <div class="form-row">
+        <label>Keyword filter
+            <input type="text" name="filter_keywords" placeholder="e.g. spoiler, giveaway, nsfw">
+            <span class="hint" style="margin: 0.2rem 0 0;">Comma-separated, case-insensitive, matched against item title and summary.</span>
+        </label>
+        <label>Filter mode
+            <select name="filter_mode">
+                <option value="exclude">Exclude matching items</option>
+                <option value="include">Only include matching items</option>
+            </select>
+        </label>
+    </div>
     <details class="template-vars">
         <summary>Available template variables</summary>
         <table class="vars-table">
@@ -96,6 +108,8 @@
             data-destination-id="{{ echo.destination_id }}"
             data-template="{{ echo.template | e }}"
             data-visibility="{{ echo.visibility }}"
+            data-filter-keywords="{{ echo.filter_keywords | e }}"
+            data-filter-mode="{{ echo.filter_mode }}"
             data-enabled="{{ echo.enabled }}">
             <td data-label="Feed">{{ echo.feed_name }}</td>
             <td data-label="Destination">
@@ -103,6 +117,11 @@
                 <span class="badge badge-success">Mastodon</span> <code>{{ echo.destination_name }}</code>
                 {% elif echo.destination_type == 'email' %}
                 <span class="badge badge-success">Email</span> {{ echo.destination_name }}
+                {% endif %}
+                {% if echo.filter_keywords %}
+                <br><span class="badge badge-warning" title="{{ echo.filter_keywords | e }}">
+                    {{ 'only' if echo.filter_mode == 'include' else 'not' }}: {{ echo.filter_keywords }}
+                </span>
                 {% endif %}
             </td>
             <td data-label="Visibility">{{ echo.visibility }}</td>

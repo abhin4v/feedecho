@@ -32,6 +32,8 @@
             <td data-label="Status">
                 {% if post.status == 'success' %}
                 <span class="badge badge-success">Success</span>
+                {% elif post.status == 'filtered' %}
+                <span class="badge badge-warning">Filtered</span>
                 {% else %}
                 <span class="badge badge-danger">Failed</span>
                 {% endif %}

@@ -504,6 +504,7 @@ async def fetch_now(feed_id: int):
 
 VALID_VISIBILITY = {"public", "unlisted", "private", "direct"}
 VALID_DEST_TYPES = {"mastodon", "email"}
+VALID_FILTER_MODES = {"exclude", "include"}
 
 
 @app.post("/api/echoes")
@@ -514,12 +515,16 @@ async def add_echo(
     email_account_id: int = Form(None),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
+    filter_keywords: str = Form(""),
+    filter_mode: str = Form("exclude"),
     enabled: str = Form(""),
 ):
     if destination_type not in VALID_DEST_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid destination type")
     if visibility not in VALID_VISIBILITY:
         raise HTTPException(status_code=400, detail=f"Invalid visibility")
+    if filter_mode not in VALID_FILTER_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid filter mode")
 
     # Resolve destination_id based on type
     if destination_type == "mastodon":
@@ -534,9 +539,11 @@ async def add_echo(
     is_enabled = 1 if enabled else 0
     with get_db() as db:
         db.execute(
-            """INSERT INTO echoes (feed_id, destination_type, destination_id, template, visibility, enabled)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (feed_id, destination_type, destination_id, template, visibility, is_enabled),
+            """INSERT INTO echoes (feed_id, destination_type, destination_id, template, visibility,
+                                   filter_keywords, filter_mode, enabled)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (feed_id, destination_type, destination_id, template, visibility,
+             filter_keywords.strip(), filter_mode, is_enabled),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 
@@ -561,12 +568,16 @@ async def edit_echo(
     email_account_id: int = Form(None),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
+    filter_keywords: str = Form(""),
+    filter_mode: str = Form("exclude"),
     enabled: str = Form(""),
 ):
     if destination_type not in VALID_DEST_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid destination type")
     if visibility not in VALID_VISIBILITY:
         raise HTTPException(status_code=400, detail=f"Invalid visibility")
+    if filter_mode not in VALID_FILTER_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid filter mode")
 
     if destination_type == "mastodon":
         destination_id = account_id
@@ -584,8 +595,10 @@ async def edit_echo(
             raise HTTPException(status_code=404, detail="Echo not found")
         db.execute(
             """UPDATE echoes SET feed_id = ?, destination_type = ?, destination_id = ?,
-               template = ?, visibility = ?, enabled = ? WHERE id = ?""",
-            (feed_id, destination_type, destination_id, template, visibility, is_enabled, echo_id),
+               template = ?, visibility = ?, filter_keywords = ?, filter_mode = ?, enabled = ?
+               WHERE id = ?""",
+            (feed_id, destination_type, destination_id, template, visibility,
+             filter_keywords.strip(), filter_mode, is_enabled, echo_id),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 

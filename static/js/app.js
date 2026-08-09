@@ -74,6 +74,8 @@ function editEcho(echoId) {
     const destId = row.dataset.destinationId;
     const template = row.dataset.template;
     const visibility = row.dataset.visibility;
+    const filterKeywords = row.dataset.filterKeywords || '';
+    const filterMode = row.dataset.filterMode || 'exclude';
     const enabled = row.dataset.enabled === '1';
 
     const feedOpts = document.getElementById('feed-options').innerHTML;
@@ -122,6 +124,17 @@ function editEcho(echoId) {
             <div class="form-row">
                 <label>Template
                     <textarea name="template" rows="3">${escapeHTML(template)}</textarea>
+                </label>
+            </div>
+            <div class="form-row">
+                <label>Keyword filter
+                    <input type="text" name="filter_keywords" value="${escapeHTML(filterKeywords)}" placeholder="e.g. spoiler, giveaway, nsfw">
+                </label>
+                <label>Filter mode
+                    <select name="filter_mode">
+                        <option value="exclude"${filterMode === 'exclude' ? ' selected' : ''}>Exclude matching items</option>
+                        <option value="include"${filterMode === 'include' ? ' selected' : ''}>Only include matching items</option>
+                    </select>
                 </label>
             </div>
             <div class="form-row edit-actions">

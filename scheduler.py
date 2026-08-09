@@ -12,6 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from database import get_db
 from email_sender import send_email
 from feed_parser import fetch_feed, get_new_items, truncate
+from filters import is_filtered
 from mastodon import post_status
 from template_engine import render_template
 
@@ -283,6 +284,11 @@ def _claim_post(echo_id: int, item: dict) -> tuple[int, str] | None:
 
 
 def _post_succeeded(echo_id: int, item_id: str) -> bool:
+    """True when the item is in a terminal state for this echo.
+
+    'success' and 'filtered' both count as handled: neither should be
+    retried, and neither should block cursor advancement.
+    """
     with get_db() as db:
         row = db.execute(
             """
@@ -293,13 +299,47 @@ def _post_succeeded(echo_id: int, item_id: str) -> bool:
             """,
             (echo_id, item_id),
         ).fetchone()
-    return bool(row and row["status"] == "success")
+    return bool(row and row["status"] in ("success", "filtered"))
+
+
+def _record_filtered(echo_id: int, item: dict) -> None:
+    """Record an item suppressed by the echo's keyword filter.
+
+    Uses status 'filtered' so history shows what was dropped and the claim
+    logic never retries it (only 'failed' and stale 'pending' rows are
+    reclaimable).
+    """
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO posted_items (
+                echo_id, item_id, item_title, item_url, status,
+                attempt_count, error_message
+            )
+            VALUES (?, ?, ?, ?, 'filtered', 0, NULL)
+            ON CONFLICT(echo_id, item_id) DO NOTHING
+            """,
+            (echo_id, item["id"], item.get("title", ""), item.get("link", "")),
+        )
 
 
 def process_echo(echo, item: dict) -> bool:
     """Deliver one item to one echo using an atomic pending-row claim."""
     echo_id = echo["id"]
     item_id = item["id"]
+
+    # Keyword filter: suppressed items count as handled so the cursor
+    # advances and they are never delivered or retried.
+    # .get-style access keeps plain-dict fixtures in tests working.
+    try:
+        filter_kw = echo["filter_keywords"]
+        filter_mode = echo["filter_mode"]
+    except (KeyError, IndexError):
+        filter_kw, filter_mode = None, None
+    if is_filtered(item, filter_kw, filter_mode):
+        _record_filtered(echo_id, item)
+        logger.info("Echo %s: item %s suppressed by keyword filter", echo_id, item_id)
+        return True
 
     claimed = _claim_post(echo_id, item)
     if claimed is None:
