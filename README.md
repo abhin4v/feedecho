@@ -29,16 +29,58 @@ Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echo
 
 ## Quick Start
 
+### Docker (recommended)
+
 ```bash
-git clone https://github.com/yourusername/feedecho.git
+git clone https://github.com/jcrabapple/feedecho.git
+cd feedecho
+
+# Set your access token (required) and public URL (for Mastodon OAuth)
+cat > .env <<'EOF'
+FEEDCHO_AUTH_TOKEN=change-me-to-a-long-random-string
+FEEDCHO_CALLBACK_URL=http://localhost:8453/oauth/callback
+EOF
+
+docker compose up -d
+```
+
+Open `http://localhost:8453` and log in with your `FEEDCHO_AUTH_TOKEN`.
+
+Data lives in the `feedecho-data` volume (`/app/data` in the container) — your feeds, accounts, and history survive `docker compose up -d --build` rebuilds.
+
+Plain Docker without compose:
+
+```bash
+docker build -t feedecho .
+docker run -d --name feedecho \
+  -p 8453:8453 \
+  -v feedecho-data:/app/data \
+  -e FEEDCHO_AUTH_TOKEN=change-me-to-a-long-random-string \
+  -e FEEDCHO_CALLBACK_URL=http://localhost:8453/oauth/callback \
+  feedecho
+```
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `FEEDCHO_AUTH_TOKEN` | yes (for any real deployment) | Shared-secret login for the web UI. If unset, auth is **disabled** — only safe on localhost. |
+| `FEEDCHO_CALLBACK_URL` | for Mastodon OAuth | Public callback URL, e.g. `https://feedecho.example.com/oauth/callback`. Must match the URL reachable by your browser. |
+| `FEEDCHO_DB_PATH` | no | SQLite path (default `/app/data/feedecho.db` in Docker, `./feedecho.db` otherwise) |
+| `FEEDCHO_STATE_SECRET` | no | OAuth state signing secret (defaults to `FEEDCHO_AUTH_TOKEN`) |
+
+Behind a reverse proxy (nginx, Caddy, Traefik), point the proxy at port `8453` and set `FEEDCHO_CALLBACK_URL` to the public HTTPS URL.
+
+### From source
+
+```bash
+git clone https://github.com/jcrabapple/feedecho.git
 cd feedecho
 python -m venv .venv
 source .venv/bin/activate
 pip install fastapi "uvicorn[standard]" jinja2 python-multipart feedparser httpx apscheduler
-python -m uvicorn app:app --host 0.0.0.0 --port 8453
+FEEDCHO_AUTH_TOKEN=your-token python -m uvicorn app:app --host 0.0.0.0 --port 8453
 ```
-
-Open `http://localhost:8453` in your browser.
 
 ## Usage
 

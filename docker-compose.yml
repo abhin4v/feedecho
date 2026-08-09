@@ -1,0 +1,20 @@
+services:
+  feedecho:
+    build: .
+    # Or use the pre-built image once published:
+    # image: ghcr.io/jcrabapple/feedecho:latest
+    container_name: feedecho
+    restart: unless-stopped
+    ports:
+      - "8453:8453"
+    volumes:
+      - feedecho-data:/app/data
+    environment:
+      # Access token for the web UI (required)
+      - FEEDCHO_AUTH_TOKEN=${FEEDCHO_AUTH_TOKEN}
+      # Public base URL — required for Mastodon OAuth callbacks
+      # e.g. https://feedecho.example.com/oauth/callback
+      - FEEDCHO_CALLBACK_URL=${FEEDCHO_CALLBACK_URL:-http://localhost:8453/oauth/callback}
+
+volumes:
+  feedecho-data:
