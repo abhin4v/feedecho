@@ -7,10 +7,12 @@
 
   outputs = { self, nixpkgs }:
     let
-      # Helper to build the package for a given system
-      mkPackage = system:
+      supportedSystems = nixpkgs.lib.systems.flakeExposed;
+
+      forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems f;
+
+      mkPackage = pkgs:
         let
-          pkgs = import nixpkgs { inherit system; };
           python = pkgs.python312;
         in
         python.pkgs.buildPythonApplication {
@@ -20,7 +22,6 @@
           format = "pyproject";
 
           nativeBuildInputs = [ python.pkgs.hatchling ];
-          build-system = [ python.pkgs.hatchling ];
 
           propagatedBuildInputs = with python.pkgs; [
             fastapi
@@ -37,13 +38,16 @@
             pytest-asyncio
           ];
 
-          # Tests need a writable temp DB; safe to run in checkPhase.
           checkPhase = ''
             runHook preCheck
             python -m pytest tests/ -q
             runHook postCheck
           '';
           doCheck = false;
+
+          # Expose the Python interpreter so the NixOS module can derive
+          # the correct site-packages path.
+          passthru.python = python;
 
           meta = with pkgs.lib; {
             description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon";
@@ -53,26 +57,61 @@
             platforms = platforms.linux ++ platforms.darwin;
           };
         };
+
+      # Build a NixOS module that receives the flake-built package so the
+      # module and the package are never disconnected.
+      mkNixosModule = pkgs:
+        { config, lib, pkgs', ... }:
+        import ./nix/module.nix {
+          inherit config lib;
+          pkgs = pkgs // { feedecho-pkg = mkPackage pkgs; };
+        };
     in
     {
-      # Expose the package per-system
-      packages = builtins.listToAttrs (
-        builtins.map
-          (system: {
-            name = system;
-            value = {
-              default = mkPackage system;
-              feedecho = mkPackage system;
-            };
-          })
-          nixpkgs.lib.systems.flakeExposed
-      );
+      packages = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+            pkg = mkPackage pkgs;
+        in {
+          default = pkg;
+          feedecho = pkg;
+        });
 
-      # NixOS module — system-independent
-      nixosModules.default = import ./nix/module.nix;
-      nixosModules.feedecho = import ./nix/module.nix;
+      # Run the test suite via `nix build .#checks.<system>.tests`
+      checks = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          tests = (mkPackage pkgs).overrideAttrs (_: { doCheck = true; });
+        });
 
-      # Also expose the module at top level for `nixosModules.feedecho`
-      nixosModule = import ./nix/module.nix;
+      devShells = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.mkShell {
+            packages = with pkgs.python312.pkgs; [
+              fastapi
+              uvicorn
+              jinja2
+              python-multipart
+              feedparser
+              httpx
+              apscheduler
+              pytest
+              pytest-asyncio
+            ];
+          };
+        });
+
+      # NixOS module — system-independent. When consumed via the flake,
+      # services.feedecho.package defaults to the flake-built package.
+      nixosModules.default = { config, lib, pkgs, ... }@args:
+        import ./nix/module.nix {
+          inherit config lib;
+          pkgs = pkgs // {
+            feedecho-flake-pkg =
+              self.packages.${pkgs.system}.default or
+              (pkgs.callPackage ./nix/package.nix { });
+          };
+        };
+      nixosModules.feedecho = self.nixosModules.default;
     };
 }

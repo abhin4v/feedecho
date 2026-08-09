@@ -1,8 +1,7 @@
 # Standalone package derivation (for non-flake NixOS users)
-# Used by nix/module.nix when not consuming via flake.nix.
+# Used by nix/module.nix default when not consuming via flake.nix.
 { lib
 , python ? python3
-, hatchling
 , fetchFromGitHub ? null
 , src ? null
 }:
@@ -15,13 +14,12 @@ python.pkgs.buildPythonApplication {
     owner = "jcrabapple";
     repo = "feedecho";
     rev = "v1.5.0";
-    hash = lib.fakeHash; # replace after first build: `nix hash-from-path ./src`
+    hash = lib.fakeHash; # replace after first build: `nix-prefetch-url --unpack <url>`
   };
 
   format = "pyproject";
 
-  nativeBuildInputs = [ hatchling ];
-  build-system = [ hatchling ];
+  nativeBuildInputs = [ python.pkgs.hatchling ];
 
   propagatedBuildInputs = with python.pkgs; [
     fastapi
@@ -43,10 +41,15 @@ python.pkgs.buildPythonApplication {
 
   doCheck = false;
 
+  # Expose the Python interpreter so the module can derive the correct
+  # site-packages path without hardcoding "python3.12".
+  passthru.python = python;
+
   meta = with lib; {
     description = "Self-hosted RSS feed cross-poster";
     homepage = "https://github.com/jcrabapple/feedecho";
     license = licenses.mit;
+    mainProgram = "uvicorn";
     platforms = platforms.linux ++ platforms.darwin;
   };
 }

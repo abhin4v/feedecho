@@ -11,18 +11,30 @@
 # Then `nixos-rebuild switch`. The app runs on port 8453 by default.
 # Put a reverse proxy (nginx, caddy) in front for TLS.
 
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs }:
 
 let
   cfg = config.services.feedecho;
+
+  # Prefer the flake-built package injected by flake.nix; fall back to
+  # callPackage for non-flake (channel) users.
+  defaultPkg = pkgs.feedecho-flake-pkg or (pkgs.callPackage ./package.nix { });
+
+  # Derive the site-packages path from the package's Python interpreter
+  # instead of hardcoding "python3.12".
+  pythonSitePackages =
+    if cfg.package ? python then
+      "${cfg.package}/lib/${cfg.package.python.libPrefix}/site-packages"
+    else
+      "${cfg.package}/lib/python3.12/site-packages";
 in {
   options.services.feedecho = {
     enable = lib.mkEnableOption "FeedEcho RSS feed cross-poster";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix { python = pkgs.python312; };
-      defaultText = lib.literalExpression "pkgs.callPackage ./nix/package.nix { }";
+      default = defaultPkg;
+      defaultText = lib.literalExpression "pkgs.feedecho-flake-pkg or (pkgs.callPackage ./nix/package.nix { })";
       description = "FeedEcho package to use.";
     };
 
@@ -36,7 +48,7 @@ in {
       type = lib.types.path;
       description = ''
         Path to a file containing the auth token for the FeedEcho web UI.
-        Use <literal>services.feedecho.authToken</literal> for testing only —
+        Use `services.feedecho.authToken` for testing only —
         prefer a secret file for real deployments.
       '';
     };
@@ -48,7 +60,7 @@ in {
     };
 
     dataDir = lib.mkOption {
-      type = lib.types.path;
+      type = lib.types.str;
       default = "/var/lib/feedecho";
       description = "Directory for the SQLite database.";
     };
@@ -94,14 +106,14 @@ in {
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = true;
-        ReadWritePaths = [ cfg.dataDir ];
       };
 
       # Read the auth token from the credential file and exec uvicorn.
-      # WorkingDirectory is set to site-packages so app.py, templates/,
-      # and static/ are all resolvable.
+      # We cd into site-packages so app.py, templates/, and static/ are
+      # all resolvable. The path is derived from the package's Python
+      # interpreter to avoid hardcoding a version.
       script = ''
-        cd "${cfg.package}/lib/python3.12/site-packages"
+        cd "${pythonSitePackages}"
         export FEEDCHO_AUTH_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/auth_token")
         exec ${cfg.package}/bin/uvicorn app:app --host 0.0.0.0 --port ${toString cfg.port}
       '';
