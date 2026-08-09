@@ -159,3 +159,37 @@ function escapeHTML(str) {
     div.appendChild(document.createTextNode(str));
     return div.innerHTML;
 }
+
+/* Theme toggle — persists to localStorage, falls back to system preference */
+(function () {
+    const btn = document.getElementById('theme-toggle');
+    if (!btn) return;
+
+    function currentTheme() {
+        return document.documentElement.getAttribute('data-theme') || 'dark';
+    }
+
+    function render(theme) {
+        btn.textContent = theme === 'light' ? '☀' : '☾';
+        btn.setAttribute('aria-pressed', theme === 'light' ? 'true' : 'false');
+    }
+
+    render(currentTheme());
+
+    btn.addEventListener('click', function () {
+        const next = currentTheme() === 'light' ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', next);
+        try { localStorage.setItem('feedecho-theme', next); } catch (e) {}
+        render(next);
+    });
+
+    // Follow system preference changes when the user hasn't chosen explicitly
+    window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', function (e) {
+        let stored = null;
+        try { stored = localStorage.getItem('feedecho-theme'); } catch (err) {}
+        if (stored) return;
+        const theme = e.matches ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', theme);
+        render(theme);
+    });
+})();

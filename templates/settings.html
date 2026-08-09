@@ -10,7 +10,7 @@
     {% if smtp_configured %}
     <div class="alert alert-success">SMTP is configured ({{ smtp_settings.smtp_host }}:{{ smtp_settings.smtp_port }}).</div>
     {% else %}
-    <div class="alert alert-error" style="border-color: var(--warning); color: var(--warning); background: rgba(199,156,58,0.15);">SMTP not configured. Email echoes will fail until this is set up.</div>
+    <div class="alert alert-warning">SMTP not configured. Email echoes will fail until this is set up.</div>
     {% endif %}
 
     <form method="post" action="/api/settings/smtp" class="echo-form">
