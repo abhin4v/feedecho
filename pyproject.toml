@@ -1,6 +1,6 @@
 [project]
 name = "feedecho"
-version = "0.1.0"
+version = "1.5.0"
 description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon"
 requires-python = ">=3.12"
 dependencies = [
@@ -20,5 +20,26 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = [ "hatchling" ]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Flat-layout: the project dir IS the package. Include templates, static,
+# and favicon so the installed wheel is self-contained (Docker, Nix, etc.).
+packages = [ "." ]
+artifacts = [
+  "templates/*.html",
+  "static/**/*",
+  "favicon.svg",
+]
+exclude = [
+  "tests",
+  "nix",
+  "dist",
+  "uv.lock",
+  ".github",
+  ".dockerignore",
+  "Dockerfile",
+  "docker-compose.yml",
+  "flake.nix",
+]

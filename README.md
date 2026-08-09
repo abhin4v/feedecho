@@ -99,6 +99,30 @@ pip install fastapi "uvicorn[standard]" jinja2 python-multipart feedparser httpx
 FEEDCHO_AUTH_TOKEN=your-token python -m uvicorn app:app --host 0.0.0.0 --port 8453
 ```
 
+### NixOS
+
+FeedEcho ships a Nix flake and a NixOS module. See [`nix/README.md`](nix/README.md) for full instructions.
+
+```nix
+{
+  inputs.feedecho.url = "github:jcrabapple/feedecho";
+  outputs = { self, nixpkgs, feedecho, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        feedecho.nixosModules.default
+        {
+          services.feedecho = {
+            enable = true;
+            authTokenFile = "/run/secrets/feedecho-token";
+            callbackUrl = "https://feedecho.example.com/oauth/callback";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
 ## Usage
 
 1. **Add a Mastodon account** — Go to `/accounts`, enter your instance URL, click "Connect Account". OAuth handles the rest.
