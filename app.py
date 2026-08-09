@@ -311,9 +311,17 @@ async def history_page(request: Request):
 async def settings_page(request: Request):
     smtp_settings = _get_smtp_settings(mask_password=True)
     smtp_configured = bool(smtp_settings.get("smtp_host"))
+    with get_db() as db:
+        rows = db.execute(
+            """SELECT key, value FROM settings
+               WHERE key IN ('retry_max_attempts', 'retry_backoff_minutes',
+                             'notify_failure_threshold', 'notify_email')"""
+        ).fetchall()
+    retry_notify = {r["key"]: r["value"] for r in rows}
     return render("settings.html", request,
                   smtp_settings=smtp_settings,
-                  smtp_configured=smtp_configured)
+                  smtp_configured=smtp_configured,
+                  retry_notify=retry_notify)
 
 
 @app.get("/healthz")
@@ -421,6 +429,28 @@ async def test_smtp(
     return {"success": success, "message": message}
 
 
+@app.post("/api/settings/retry-notify")
+async def save_retry_notify_settings(
+    retry_max_attempts: int = Form(5),
+    retry_backoff_minutes: int = Form(5),
+    notify_failure_threshold: int = Form(3),
+    notify_email: str = Form(""),
+):
+    values = {
+        "retry_max_attempts": str(max(0, min(retry_max_attempts, 100))),
+        "retry_backoff_minutes": str(max(1, min(retry_backoff_minutes, 1440))),
+        "notify_failure_threshold": str(max(0, min(notify_failure_threshold, 100))),
+        "notify_email": notify_email.strip(),
+    }
+    with get_db() as db:
+        for key, value in values.items():
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+    return RedirectResponse(url="/settings?status=saved", status_code=303)
+
+
 # ── API: Feeds ──────────────────────────────────────────────────────────────
 
 @app.post("/api/feeds")
@@ -488,6 +518,17 @@ async def init_feed(feed_id: int):
             return {"success": False, "error": str(e)}
 
 
+@app.post("/api/feeds/{feed_id}/pause")
+async def pause_feed(feed_id: int):
+    with get_db() as db:
+        feed = db.execute("SELECT paused FROM feeds WHERE id = ?", (feed_id,)).fetchone()
+        if not feed:
+            raise HTTPException(status_code=404, detail="Feed not found")
+        new_val = 0 if feed["paused"] else 1
+        db.execute("UPDATE feeds SET paused = ? WHERE id = ?", (new_val, feed_id))
+    return {"success": True, "paused": bool(new_val)}
+
+
 @app.post("/api/feeds/{feed_id}/fetch")
 async def fetch_now(feed_id: int):
     """Trigger an immediate feed check."""
@@ -498,6 +539,42 @@ async def fetch_now(feed_id: int):
         return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@app.post("/api/history/{posted_id}/retry")
+async def retry_post(posted_id: int):
+    """Force a failed or gave_up row back to retryable: clears backoff and
+    resets the attempt counter so the next feed check reprocesses it."""
+    with get_db() as db:
+        result = db.execute(
+            """UPDATE posted_items
+                  SET attempt_count = 0,
+                      next_retry_at = NULL,
+                      error_message = NULL
+                WHERE id = ?
+                  AND status IN ('failed', 'gave_up')""",
+            (posted_id,),
+        )
+        if result.rowcount != 1:
+            raise HTTPException(status_code=404, detail="No failed post with that id")
+    return {"success": True, "message": "Post queued for retry on next feed check"}
+
+
+@app.post("/api/history/{posted_id}/give-up")
+async def give_up_post(posted_id: int):
+    """Mark a failed row terminal so the feed cursor can advance past it."""
+    with get_db() as db:
+        result = db.execute(
+            """UPDATE posted_items
+                  SET status = 'gave_up',
+                      next_retry_at = NULL
+                WHERE id = ?
+                  AND status = 'failed'""",
+            (posted_id,),
+        )
+        if result.rowcount != 1:
+            raise HTTPException(status_code=404, detail="No failed post with that id")
+    return {"success": True, "message": "Post marked as given up"}
 
 
 # ── API: Echoes ─────────────────────────────────────────────────────────────

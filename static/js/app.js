@@ -49,6 +49,43 @@ async function fetchNow(feedId) {
     }
 }
 
+async function pauseFeed(feedId) {
+    try {
+        const resp = await fetch(`/api/feeds/${feedId}/pause`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            location.reload();
+        } else {
+            alert(data.detail || 'Failed to toggle pause');
+        }
+    } catch (e) {
+        alert('Request failed: ' + e.message);
+    }
+}
+
+async function retryPost(postedId) {
+    try {
+        const resp = await fetch(`/api/history/${postedId}/retry`, { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || data.detail || 'Done');
+        if (data.success) location.reload();
+    } catch (e) {
+        alert('Request failed: ' + e.message);
+    }
+}
+
+async function giveUpPost(postedId) {
+    if (!confirm('Give up on this item? The feed will move past it and it will not be delivered.')) return;
+    try {
+        const resp = await fetch(`/api/history/${postedId}/give-up`, { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || data.detail || 'Done');
+        if (data.success) location.reload();
+    } catch (e) {
+        alert('Request failed: ' + e.message);
+    }
+}
+
 async function toggleEcho(echoId) {
     try {
         const resp = await fetch(`/api/echoes/${echoId}/toggle`, { method: 'POST' });

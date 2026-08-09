@@ -96,6 +96,7 @@ def init_db() -> None:
         """)
         _add_column_if_missing(db, "feeds", "lease_token", "TEXT")
         _add_column_if_missing(db, "feeds", "lease_expires_at", "TIMESTAMP")
+        _add_column_if_missing(db, "feeds", "paused", "INTEGER NOT NULL DEFAULT 0")
 
         echo_columns = _column_names(db, "echoes")
         if (
@@ -163,6 +164,7 @@ def init_db() -> None:
             "attempt_count",
             "INTEGER NOT NULL DEFAULT 0",
         )
+        _add_column_if_missing(db, "posted_items", "next_retry_at", "TIMESTAMP")
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS oauth_apps (

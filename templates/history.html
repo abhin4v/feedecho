@@ -14,6 +14,7 @@
             <th>Item</th>
             <th>Status</th>
             <th>Error</th>
+            <th>Actions</th>
         </tr>
     </thead>
     <tbody>
@@ -34,11 +35,22 @@
                 <span class="badge badge-success">Success</span>
                 {% elif post.status == 'filtered' %}
                 <span class="badge badge-warning">Filtered</span>
+                {% elif post.status == 'gave_up' %}
+                <span class="badge badge-danger">Gave up</span>
                 {% else %}
                 <span class="badge badge-danger">Failed</span>
+                {% if post.attempt_count %}<br><small>attempt {{ post.attempt_count }}{% if post.next_retry_at %} · retry {{ post.next_retry_at }}{% endif %}</small>{% endif %}
                 {% endif %}
             </td>
             <td data-label="Error"><small>{{ post.error_message or '' }}</small></td>
+            <td data-label="Actions" class="action-cell">
+                {% if post.status in ('failed', 'gave_up') %}
+                <button class="btn-sm" onclick="retryPost({{ post.id }})">Retry</button>
+                {% endif %}
+                {% if post.status == 'failed' %}
+                <button class="btn-sm" onclick="giveUpPost({{ post.id }})">Give up</button>
+                {% endif %}
+            </td>
         </tr>
         {% endfor %}
     </tbody>

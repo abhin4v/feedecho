@@ -54,4 +54,32 @@
         <button type="submit" class="btn-sm">Send Test Email</button>
     </form>
 </section>
+
+<section>
+    <h2>Retries &amp; Failure Notifications</h2>
+    <p class="hint">Failed deliveries retry automatically with exponential backoff. After the max attempts, the item is marked "Gave up" and the feed moves on. Notifications require SMTP to be configured above.</p>
+
+    <form method="post" action="/api/settings/retry-notify" class="echo-form">
+        <div class="form-row">
+            <label>Max delivery attempts
+                <input type="number" name="retry_max_attempts" value="{{ retry_notify.get('retry_max_attempts', '5') }}" min="0" max="100">
+                <span class="hint" style="margin: 0.2rem 0 0;">0 = retry forever</span>
+            </label>
+            <label>Retry backoff (minutes)
+                <input type="number" name="retry_backoff_minutes" value="{{ retry_notify.get('retry_backoff_minutes', '5') }}" min="1" max="1440">
+                <span class="hint" style="margin: 0.2rem 0 0;">First retry delay; doubles each attempt</span>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>Notify after consecutive failures
+                <input type="number" name="notify_failure_threshold" value="{{ retry_notify.get('notify_failure_threshold', '3') }}" min="0" max="100">
+                <span class="hint" style="margin: 0.2rem 0 0;">0 = notifications off</span>
+            </label>
+            <label>Notification email
+                <input type="email" name="notify_email" value="{{ retry_notify.get('notify_email', '') }}" placeholder="defaults to first email account">
+            </label>
+        </div>
+        <button type="submit">Save Retry &amp; Notification Settings</button>
+    </form>
+</section>
 {% endblock %}

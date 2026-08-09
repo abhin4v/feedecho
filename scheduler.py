@@ -14,6 +14,12 @@ from email_sender import send_email
 from feed_parser import fetch_feed, get_new_items, truncate
 from filters import is_filtered
 from mastodon import post_status
+from notify import (
+    max_attempts,
+    next_retry_delay,
+    record_failure,
+    record_success,
+)
 from template_engine import render_template
 
 logger = logging.getLogger("feedecho.scheduler")
@@ -138,6 +144,11 @@ def _check_feed_with_lease(feed_id: int, lease_token: str) -> None:
             logger.warning("Feed %s not found", feed_id)
             return
 
+        if feed["paused"]:
+            logger.info("Feed %s (%s): paused; skipping", feed_id, feed["name"])
+            _update_last_fetched(feed_id, lease_token)
+            return
+
         echoes = db.execute(
             "SELECT * FROM echoes WHERE feed_id = ? AND enabled = 1",
             (feed_id,),
@@ -215,13 +226,82 @@ def _check_feed_with_lease(feed_id: int, lease_token: str) -> None:
     else:
         _update_last_fetched(feed_id, lease_token)
 
+    _retry_due_failures(feed_id, echoes)
+
+
+def _retry_due_failures(feed_id: int, echoes) -> None:
+    """Reprocess failed rows whose backoff has elapsed, regardless of cursor.
+
+    Normal cursor replay only covers items at-or-after the cursor. Failed rows
+    can sit behind it (e.g. an item that failed, was manually reset, or was
+    blocked while another echo's item gated advancement). This sweep gives
+    them their scheduled retries without disturbing feed ordering guarantees.
+    """
+    if not echoes:
+        return
+    echo_ids = [e["id"] for e in echoes]
+    placeholders = ",".join("?" for _ in echo_ids)
+
+    with get_db() as db:
+        due = db.execute(
+            f"""
+            SELECT id, echo_id, item_id FROM posted_items
+             WHERE echo_id IN ({placeholders})
+               AND status = 'failed'
+               AND next_retry_at IS NOT NULL
+               AND next_retry_at <= ?
+             ORDER BY id
+             LIMIT 25
+            """,
+            (*echo_ids, _now()),
+        ).fetchall()
+
+    if not due:
+        return
+
+    # We only have item_id stored, not the full item payload. Fetch the feed
+    # once and match; items that have aged out of the feed are marked gave_up.
+    try:
+        feed_data = fetch_feed(db_feed_url(feed_id))
+    except Exception:
+        logger.exception("Feed %s: fetch failed during retry sweep", feed_id)
+        return
+
+    items_by_id = {it["id"]: it for it in (feed_data.get("items") or [])}
+    echoes_by_id = {e["id"]: e for e in echoes}
+
+    for row in due:
+        item = items_by_id.get(row["item_id"])
+        if item is None:
+            with get_db() as db:
+                db.execute(
+                    """UPDATE posted_items SET status = 'gave_up',
+                          error_message = 'Item no longer in feed; cannot retry',
+                          next_retry_at = NULL
+                        WHERE id = ? AND status = 'failed'""",
+                    (row["id"],),
+                )
+            continue
+        echo = echoes_by_id.get(row["echo_id"])
+        if echo is not None:
+            process_echo(echo, item)
+
+
+def db_feed_url(feed_id: int) -> str:
+    with get_db() as db:
+        row = db.execute("SELECT url FROM feeds WHERE id = ?", (feed_id,)).fetchone()
+    if not row:
+        raise ValueError(f"Feed {feed_id} not found")
+    return row["url"]
+
 
 def _claim_post(echo_id: int, item: dict) -> tuple[int, str] | None:
     """Atomically claim an echo/item row.
 
     Returns ``(posted_item_id, claim_token)`` only for the worker that owns the
-    pending attempt. Fresh pending rows cannot be claimed. Failed rows and
-    pending rows abandoned for over ten minutes can be reclaimed.
+    pending attempt. Fresh pending rows cannot be claimed. Failed rows can be
+    reclaimed once their backoff (next_retry_at) has elapsed, and pending rows
+    abandoned for over ten minutes can be reclaimed.
     """
     item_id = item["id"]
     claim_token = secrets.token_urlsafe(32)
@@ -245,6 +325,10 @@ def _claim_post(echo_id: int, item: dict) -> tuple[int, str] | None:
                 attempt_count = posted_items.attempt_count + 1,
                 error_message = NULL
             WHERE posted_items.status = 'failed'
+               AND (
+                    posted_items.next_retry_at IS NULL
+                    OR posted_items.next_retry_at <= ?
+               )
                OR (
                     posted_items.status = 'pending'
                     AND (
@@ -260,6 +344,7 @@ def _claim_post(echo_id: int, item: dict) -> tuple[int, str] | None:
                 item.get("link", ""),
                 now,
                 claim_token,
+                now,
                 stale_before,
             ),
         )
@@ -283,23 +368,25 @@ def _claim_post(echo_id: int, item: dict) -> tuple[int, str] | None:
     return row["id"], claim_token
 
 
+def _row_state(echo_id: int, item_id: str) -> str | None:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT status FROM posted_items WHERE echo_id = ? AND item_id = ?",
+            (echo_id, item_id),
+        ).fetchone()
+    return row["status"] if row else None
+
+
 def _post_succeeded(echo_id: int, item_id: str) -> bool:
     """True when the item is in a terminal state for this echo.
 
-    'success' and 'filtered' both count as handled: neither should be
-    retried, and neither should block cursor advancement.
+    'success', 'filtered', and 'gave_up' all count as handled: they must not
+    be retried and must not block cursor advancement. A 'failed' row waiting
+    out its retry backoff returns False here — it still gates the cursor —
+    but process_echo distinguishes it from a fresh failure via _row_state so
+    the run stops quietly instead of logging new failures.
     """
-    with get_db() as db:
-        row = db.execute(
-            """
-            SELECT status
-              FROM posted_items
-             WHERE echo_id = ?
-               AND item_id = ?
-            """,
-            (echo_id, item_id),
-        ).fetchone()
-    return bool(row and row["status"] in ("success", "filtered"))
+    return _row_state(echo_id, item_id) in ("success", "filtered", "gave_up")
 
 
 def _record_filtered(echo_id: int, item: dict) -> None:
@@ -343,22 +430,24 @@ def process_echo(echo, item: dict) -> bool:
 
     claimed = _claim_post(echo_id, item)
     if claimed is None:
-        # A successful prior delivery is success. A fresh pending row belongs to
-        # another worker and is deliberately treated as incomplete.
+        # Terminal states (success/filtered/gave_up) count as handled. A fresh
+        # pending row belongs to another worker, and a failed row waiting out
+        # its retry backoff is deferred — both are "not done", so the cursor
+        # stays put and the run stops at this item (H-2), quietly.
         return _post_succeeded(echo_id, item_id)
 
     posted_id, claim_token = claimed
 
     try:
         content = render_template(echo["template"], item)
-    except Exception as exc:
+    except Exception:
         logger.exception("Echo %s: template render failed for item %s", echo_id, item_id)
-        _update_post(posted_id, claim_token, "failed", "Template rendering failed")
-        return False
+        gave_up = _fail_post(posted_id, claim_token, echo_id, "Template rendering failed")
+        return gave_up
 
     if not content.strip():
-        _update_post(posted_id, claim_token, "failed", "Rendered content was empty")
-        return False
+        gave_up = _fail_post(posted_id, claim_token, echo_id, "Rendered content was empty")
+        return gave_up
 
     if echo["destination_type"] == "mastodon":
         return _send_mastodon(echo, item, content, echo["destination_id"], posted_id, claim_token)
@@ -373,13 +462,13 @@ def process_echo(echo, item: dict) -> bool:
             claim_token,
         )
 
-    _update_post(
+    gave_up = _fail_post(
         posted_id,
         claim_token,
-        "failed",
+        echo_id,
         f"Unknown destination type: {echo['destination_type']}",
     )
-    return False
+    return gave_up
 
 
 def _update_post(
@@ -407,6 +496,60 @@ def _update_post(
         return result.rowcount == 1
 
 
+def _fail_post(
+    posted_id: int,
+    claim_token: str,
+    echo_id: int,
+    error: str,
+) -> bool:
+    """Mark a claimed row failed, scheduling the next automatic retry.
+
+    If the row has exhausted retry_max_attempts, it is marked 'gave_up'
+    (terminal) instead, which unblocks the feed cursor. Returns the final
+    status written.
+    """
+    cap = max_attempts()
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT attempt_count FROM posted_items WHERE id = ?", (posted_id,)
+        ).fetchone()
+    attempts = row["attempt_count"] if row else 1
+
+    if cap > 0 and attempts >= cap:
+        final = "gave_up"
+        error_out = f"Gave up after {attempts} attempts. Last error: {error}"
+        retry_at = None
+    else:
+        final = "failed"
+        error_out = error
+        retry_at = next_retry_delay(attempts)
+
+    with get_db() as db:
+        db.execute(
+            """
+            UPDATE posted_items
+               SET status = ?,
+                   error_message = ?,
+                   next_retry_at = ?,
+                   claimed_at = NULL,
+                   claim_token = NULL,
+                   posted_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+               AND status = 'pending'
+               AND claim_token = ?
+            """,
+            (final, error_out, retry_at, posted_id, claim_token),
+        )
+
+    record_failure(echo_id)
+    if final == "gave_up":
+        logger.error(
+            "Echo %s: item gave up after %s attempts: %s", echo_id, attempts, error
+        )
+    return final == "gave_up"
+
+
 def _send_mastodon(
     echo,
     item: dict,
@@ -422,8 +565,9 @@ def _send_mastodon(
         ).fetchone()
 
     if not account:
-        _update_post(posted_id, claim_token, "failed", f"Account {account_id} not found")
-        return False
+        return _fail_post(
+            posted_id, claim_token, echo["id"], f"Account {account_id} not found"
+        )
 
     try:
         post_status(
@@ -434,10 +578,12 @@ def _send_mastodon(
         )
     except Exception:
         logger.exception("Echo %s: Mastodon post failed", echo["id"])
-        _update_post(posted_id, claim_token, "failed", "Mastodon delivery failed")
-        return False
+        return _fail_post(posted_id, claim_token, echo["id"], "Mastodon delivery failed")
 
-    return _update_post(posted_id, claim_token, "success")
+    ok = _update_post(posted_id, claim_token, "success")
+    if ok:
+        record_success(echo["id"])
+    return ok
 
 
 def _send_email_echo(
@@ -455,13 +601,12 @@ def _send_email_echo(
         ).fetchone()
 
     if not account:
-        _update_post(
+        return _fail_post(
             posted_id,
             claim_token,
-            "failed",
+            echo["id"],
             f"Email account {email_account_id} not found",
         )
-        return False
 
     try:
         send_email(
@@ -474,10 +619,12 @@ def _send_email_echo(
         )
     except Exception:
         logger.exception("Echo %s: email delivery failed", echo["id"])
-        _update_post(posted_id, claim_token, "failed", "Email delivery failed")
-        return False
+        return _fail_post(posted_id, claim_token, echo["id"], "Email delivery failed")
 
-    return _update_post(posted_id, claim_token, "success")
+    ok = _update_post(posted_id, claim_token, "success")
+    if ok:
+        record_success(echo["id"])
+    return ok
 
 
 def check_all_feeds() -> None:

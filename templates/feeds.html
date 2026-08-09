@@ -27,7 +27,10 @@
     <tbody>
         {% for feed in feeds %}
         <tr>
-            <td data-label="Name">{{ feed.name }}</td>
+            <td data-label="Name">
+                {{ feed.name }}
+                {% if feed.paused %}<span class="badge badge-warning">Paused</span>{% endif %}
+            </td>
             <td data-label="URL"><a href="{{ feed.url }}" target="_blank" rel="noopener"><small>{{ feed.url[:50] }}{% if feed.url|length > 50 %}…{% endif %}</small></a></td>
             <td data-label="Interval">{{ feed.poll_interval }} min</td>
             <td data-label="Last Fetched"><small>{{ feed.last_fetched or 'Never' }}</small></td>
@@ -43,6 +46,7 @@
                 <button class="btn-sm" onclick="testFeed({{ feed.id }})">Test</button>
                 <button class="btn-sm" onclick="initFeed({{ feed.id }})">Init</button>
                 <button class="btn-sm" onclick="fetchNow({{ feed.id }})">Fetch</button>
+                <button class="btn-sm" onclick="pauseFeed({{ feed.id }})">{{ 'Resume' if feed.paused else 'Pause' }}</button>
                 <form method="post" action="/api/feeds/{{ feed.id }}/delete" class="inline">
                     <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this feed and all its echoes?')">Delete</button>
                 </form>
