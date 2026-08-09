@@ -1,8 +1,9 @@
 services:
   feedecho:
     build: .
-    # Or use the pre-built image once published:
+    # Or skip the local build and use the pre-built multi-arch image:
     # image: ghcr.io/jcrabapple/feedecho:latest
+    # pull_policy: always
     container_name: feedecho
     restart: unless-stopped
     ports:

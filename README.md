@@ -31,6 +31,23 @@ Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echo
 
 ### Docker (recommended)
 
+Pre-built multi-arch images (amd64 + arm64) are published to GHCR on every release — no local build needed:
+
+```bash
+mkdir feedecho && cd feedecho
+
+cat > .env <<'EOF'
+FEEDCHO_AUTH_TOKEN=change-me-to-a-long-random-string
+FEEDCHO_CALLBACK_URL=http://localhost:8453/oauth/callback
+EOF
+
+curl -O https://raw.githubusercontent.com/jcrabapple/feedecho/master/docker-compose.yml
+# Then edit docker-compose.yml: comment out `build: .` and uncomment the `image:` line
+docker compose up -d
+```
+
+Or clone the repo and build locally:
+
 ```bash
 git clone https://github.com/jcrabapple/feedecho.git
 cd feedecho
