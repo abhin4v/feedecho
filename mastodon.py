@@ -5,12 +5,61 @@ from typing import Optional
 from feed_parser import validate_outbound_url
 
 
+def upload_media(
+    instance: str,
+    access_token: str,
+    image_bytes: bytes,
+    content_type: str,
+    description: str = "",
+) -> dict | None:
+    """Upload an image to a Mastodon instance for attachment to a status.
+
+    Args:
+        instance: Base URL of the instance (e.g. "https://dmv.community")
+        access_token: OAuth access token
+        image_bytes: Raw image bytes
+        content_type: MIME type (e.g. "image/jpeg")
+        description: Alt text for the image (optional)
+
+    Returns:
+        Dict with 'id' (media attachment ID) on success, None on failure.
+    """
+    instance = instance.rstrip("/")
+    validate_outbound_url(instance)
+    url = f"{instance}/api/v2/media"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Map MIME type to filename extension for the upload
+    ext_map = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/gif": "gif",
+        "image/webp": "webp",
+        "image/avif": "avif",
+    }
+    ext = ext_map.get(content_type, "jpg")
+    files = {"file": (f"image.{ext}", image_bytes, content_type)}
+    data = {}
+    if description:
+        data["description"] = description[:1500]  # Mastodon caps alt text at 1500 chars
+
+    try:
+        with httpx.Client(timeout=60) as client:
+            response = client.post(url, headers=headers, files=files, data=data)
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        return None
+
+
 def post_status(
     instance: str,
     access_token: str,
     content: str,
     visibility: str = "public",
     sensitive: bool = False,
+    spoiler_text: str = "",
+    media_ids: list[str] | None = None,
 ) -> dict:
     """Post a status to a Mastodon instance.
 
@@ -20,6 +69,8 @@ def post_status(
         content: The status text
         visibility: public, unlisted, private, or direct
         sensitive: Mark as sensitive content
+        spoiler_text: Content warning text (shown above the post body)
+        media_ids: List of media attachment IDs to attach
 
     Returns:
         Dict with response data including 'id' and 'url' on success.
@@ -36,6 +87,11 @@ def post_status(
         "visibility": visibility,
         "sensitive": sensitive,
     }
+    if spoiler_text:
+        data["spoiler_text"] = spoiler_text
+        data["sensitive"] = True
+    if media_ids:
+        data["media_ids[]"] = media_ids
 
     with httpx.Client(timeout=30) as client:
         response = client.post(url, headers=headers, data=data)

@@ -123,6 +123,31 @@ def init_db() -> None:
         _add_column_if_missing(
             db, "echoes", "filter_mode", "TEXT NOT NULL DEFAULT 'exclude'"
         )
+        _add_column_if_missing(db, "echoes", "content_warning", "TEXT DEFAULT ''")
+        _add_column_if_missing(
+            db, "echoes", "attach_image", "INTEGER NOT NULL DEFAULT 0"
+        )
+        _add_column_if_missing(
+            db, "echoes", "delivery_mode", "TEXT NOT NULL DEFAULT 'instant'"
+        )
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS digest_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                echo_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                item_title TEXT,
+                item_url TEXT,
+                rendered_content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(echo_id, item_id),
+                FOREIGN KEY (echo_id) REFERENCES echoes(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_digest_items_echo
+            ON digest_items(echo_id)
+        """)
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS email_accounts (

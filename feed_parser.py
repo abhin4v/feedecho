@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 USER_AGENT = "feedecho/1.0 (+https://github.com/yourusername/feedecho)"
 MAX_FEED_SIZE = 10 * 1024 * 1024  # 10 MB cap
 MAX_REDIRECTS = 5
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB cap, matches Mastodon's default limits
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"}
 
 
 class SSRFError(ValueError):
@@ -169,6 +171,7 @@ def parse_rss_feed(parsed: feedparser.FeedParserDict, url: str) -> dict:
             "author": entry.get("author", ""),
             "date": _parse_date_struct(entry),
             "tags": [tag.get("term", "") for tag in entry.get("tags", []) if tag.get("term")],
+            "image_url": _extract_rss_image(entry),
             "raw": {k: v for k, v in entry.items()},
         }
         items.append(item)
@@ -202,6 +205,7 @@ def parse_json_feed(data: dict) -> dict:
             "author": author_name,
             "date": _parse_iso_date(entry.get("date_published") or entry.get("date_modified")),
             "tags": entry.get("tags", []),
+            "image_url": _extract_json_feed_image(entry),
             "raw": entry,
         }
         items.append(item)
@@ -279,6 +283,91 @@ def truncate(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 1].rstrip() + "…"
+
+
+def _extract_rss_image(entry: dict) -> str:
+    """Extract first image URL from an RSS/Atom entry.
+
+    Priority: media_content > media_thumbnail > enclosures > first <img> in content/summary.
+    Returns "" if no image found.
+    """
+    # media_content / media_thumbnail (Media RSS)
+    for key in ("media_content", "media_thumbnail"):
+        media_list = entry.get(key, [])
+        if media_list and isinstance(media_list, list):
+            url = media_list[0].get("url", "") if isinstance(media_list[0], dict) else ""
+            if url:
+                return url
+
+    # RSS enclosures
+    for enc in entry.get("enclosures", []):
+        if isinstance(enc, dict):
+            ctype = enc.get("type", "")
+            if ctype.startswith("image/") and enc.get("href"):
+                return enc["href"]
+
+    # First <img> in content or summary HTML
+    html_content = ""
+    if entry.get("content"):
+        html_content = entry.get("content", [{}])[0].get("value", "")
+    if not html_content:
+        html_content = entry.get("summary", "")
+    if html_content:
+        match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return ""
+
+
+def _extract_json_feed_image(entry: dict) -> str:
+    """Extract first image URL from a JSON Feed entry.
+
+    Priority: image > banner_image > first <img> in content_html.
+    Returns "" if no image found.
+    """
+    image = entry.get("image", "")
+    if image:
+        return image
+
+    banner = entry.get("banner_image", "")
+    if banner:
+        return banner
+
+    html_content = entry.get("content_html", "")
+    if html_content:
+        match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return ""
+
+
+def fetch_image(url: str) -> tuple[bytes, str] | None:
+    """Fetch an image for Mastodon media upload.
+
+    Validates URL for SSRF, caps size, and returns (content_bytes, content_type).
+    Returns None if the fetch fails, the URL is unsafe, or the content is not an image.
+    """
+    try:
+        validate_outbound_url(url)
+    except SSRFError:
+        return None
+
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        with httpx.Client(headers=headers, follow_redirects=False, timeout=30) as client:
+            response = _fetch_with_redirect_validation(client, url, headers)
+            content_type = response.headers.get("content-type", "").split(";")[0].strip()
+
+            if len(response.content) > MAX_IMAGE_SIZE:
+                return None
+            if content_type not in ALLOWED_IMAGE_TYPES:
+                return None
+
+            return response.content, content_type
+    except Exception:
+        return None
 
 
 def _get_item_id(entry: dict) -> str:

@@ -82,4 +82,40 @@
         <button type="submit">Save Retry &amp; Notification Settings</button>
     </form>
 </section>
+
+<section>
+    <h2>AI Alt Text (Optional)</h2>
+    <p class="hint">When enabled, FeedEcho generates alt text for attached images using an OpenAI-compatible vision API. Requires a vision-capable model endpoint. If disabled or unconfigured, images are uploaded without alt text.</p>
+
+    {% if alt_text_configured %}
+    <div class="alert alert-success">Vision API configured ({{ alt_text_settings.alt_text_ai_base_url }}, model: {{ alt_text_settings.alt_text_ai_model }}).</div>
+    {% else %}
+    <div class="alert alert-warning">Vision API not configured. Image attachments will be uploaded without alt text.</div>
+    {% endif %}
+
+    <form method="post" action="/api/settings/alt-text" class="echo-form">
+        <div class="form-row">
+            <label>Enable AI alt text
+                <input type="checkbox" name="alt_text_ai_enabled" value="true" {{ 'checked' if alt_text_settings.get('alt_text_ai_enabled') == '1' else '' }}>
+                <span class="hint" style="margin: 0.2rem 0 0;">Generate alt text before uploading images to Mastodon.</span>
+            </label>
+        </div>
+        <div class="form-row">
+            <label>API Base URL
+                <input type="text" name="alt_text_ai_base_url" value="{{ alt_text_settings.get('alt_text_ai_base_url', '') }}" placeholder="https://api.openai.com/v1">
+            </label>
+            <label>Model
+                <input type="text" name="alt_text_ai_model" value="{{ alt_text_settings.get('alt_text_ai_model', '') }}" placeholder="gpt-4o-mini">
+            </label>
+        </div>
+        <div class="form-row">
+            <label>API Key
+                <input type="password" name="alt_text_ai_api_key" value="{{ alt_text_settings.get('alt_text_ai_api_key', '') }}" placeholder="sk-...">
+            </label>
+        </div>
+        <button type="submit">Save Alt Text Settings</button>
+    </form>
+
+    <button type="button" class="btn-sm" onclick="testAltText()">Test Vision API</button>
+</section>
 {% endblock %}

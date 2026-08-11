@@ -74,6 +74,23 @@ async function retryPost(postedId) {
     }
 }
 
+async function testAltText() {
+    const btn = event.target;
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    try {
+        const resp = await fetch('/api/settings/alt-text/test', { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || (data.success ? 'OK' : 'Failed'));
+    } catch (e) {
+        alert('Request failed: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
+}
+
 async function giveUpPost(postedId) {
     if (!confirm('Give up on this item? The feed will move past it and it will not be delivered.')) return;
     try {
@@ -113,6 +130,9 @@ function editEcho(echoId) {
     const visibility = row.dataset.visibility;
     const filterKeywords = row.dataset.filterKeywords || '';
     const filterMode = row.dataset.filterMode || 'exclude';
+    const contentWarning = row.dataset.contentWarning || '';
+    const attachImage = row.dataset.attachImage === '1';
+    const deliveryMode = row.dataset.deliveryMode || 'instant';
     const enabled = row.dataset.enabled === '1';
 
     const feedOpts = document.getElementById('feed-options').innerHTML;
@@ -174,6 +194,22 @@ function editEcho(echoId) {
                     </select>
                 </label>
             </div>
+            <div class="form-row">
+                <label>Content warning
+                    <input type="text" name="content_warning" value="${escapeHTML(contentWarning)}" placeholder="e.g. Spoilers, US Politics" maxlength="500">
+                </label>
+                <label>Attach image
+                    <input type="checkbox" name="attach_image" value="true"${attachImage ? ' checked' : ''}>
+                </label>
+            </div>
+            <div class="form-row" id="edit-digest-fields-${echoId}" style="${emailStyle}">
+                <label>Delivery mode
+                    <select name="delivery_mode">
+                        <option value="instant"${deliveryMode === 'instant' ? ' selected' : ''}>Instant (one email per item)</option>
+                        <option value="digest"${deliveryMode === 'digest' ? ' selected' : ''}>Digest (batch items into one email, sent hourly)</option>
+                    </select>
+                </label>
+            </div>
             <div class="form-row edit-actions">
                 <button type="submit" class="btn-sm">Save</button>
                 <button type="button" class="btn-sm btn-danger" onclick="cancelEdit(${echoId})">Cancel</button>
@@ -194,6 +230,8 @@ function toggleEditDest(echoId) {
     const destType = document.getElementById(`edit-dest-type-${echoId}`).value;
     document.getElementById(`edit-mastodon-fields-${echoId}`).style.display = destType === 'mastodon' ? '' : 'none';
     document.getElementById(`edit-email-fields-${echoId}`).style.display = destType === 'email' ? '' : 'none';
+    const digestFields = document.getElementById(`edit-digest-fields-${echoId}`);
+    if (digestFields) digestFields.style.display = destType === 'email' ? '' : 'none';
 }
 
 function cancelEdit(echoId) {

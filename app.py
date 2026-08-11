@@ -28,7 +28,7 @@ from email_sender import get_smtp_settings, test_smtp_connection
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
 
-app = FastAPI(title="FeedEcho", version="1.1.0")
+app = FastAPI(title="FeedEcho", version="1.8.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -317,11 +317,23 @@ async def settings_page(request: Request):
                WHERE key IN ('retry_max_attempts', 'retry_backoff_minutes',
                              'notify_failure_threshold', 'notify_email')"""
         ).fetchall()
+        alt_rows = db.execute(
+            """SELECT key, value FROM settings
+               WHERE key IN ('alt_text_ai_enabled', 'alt_text_ai_base_url',
+                             'alt_text_ai_model', 'alt_text_ai_api_key')"""
+        ).fetchall()
     retry_notify = {r["key"]: r["value"] for r in rows}
+    alt_text_settings = {r["key"]: r["value"] for r in alt_rows}
+    alt_text_configured = bool(alt_text_settings.get("alt_text_ai_base_url"))
+    # Mask the API key before sending to the browser
+    if alt_text_settings.get("alt_text_ai_api_key"):
+        alt_text_settings["alt_text_ai_api_key"] = "********"
     return render("settings.html", request,
                   smtp_settings=smtp_settings,
                   smtp_configured=smtp_configured,
-                  retry_notify=retry_notify)
+                  retry_notify=retry_notify,
+                  alt_text_settings=alt_text_settings,
+                  alt_text_configured=alt_text_configured)
 
 
 @app.get("/healthz")
@@ -449,6 +461,53 @@ async def save_retry_notify_settings(
                 (key, value),
             )
     return RedirectResponse(url="/settings?status=saved", status_code=303)
+
+
+@app.post("/api/settings/alt-text")
+async def save_alt_text_settings(
+    alt_text_ai_enabled: str = Form(""),
+    alt_text_ai_base_url: str = Form(""),
+    alt_text_ai_model: str = Form(""),
+    alt_text_ai_api_key: str = Form(""),
+):
+    values = {
+        "alt_text_ai_enabled": "1" if alt_text_ai_enabled else "0",
+        "alt_text_ai_base_url": alt_text_ai_base_url.strip().rstrip("/"),
+        "alt_text_ai_model": alt_text_ai_model.strip(),
+    }
+    with get_db() as db:
+        for key, value in values.items():
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        # Only update API key if it's not the mask placeholder
+        if alt_text_ai_api_key and alt_text_ai_api_key != "********":
+            db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("alt_text_ai_api_key", alt_text_ai_api_key.strip()),
+            )
+    return RedirectResponse(url="/settings?status=saved", status_code=303)
+
+
+@app.post("/api/settings/alt-text/test")
+async def test_alt_text():
+    """Test the vision API connection with a minimal request."""
+    import alt_text
+    if not alt_text.is_enabled():
+        return {"success": False, "message": "AI alt text is not configured"}
+    try:
+        # Use a tiny 1x1 PNG to test the API connection
+        import base64
+        tiny_png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+        )
+        result = alt_text.generate_alt_text(tiny_png, "image/png")
+        if result:
+            return {"success": True, "message": f"API working. Response: {result[:100]}"}
+        return {"success": True, "message": "API reachable (empty response to test image)"}
+    except Exception as e:
+        return {"success": False, "message": f"API test failed: {e}"}
 
 
 # ── API: Feeds ──────────────────────────────────────────────────────────────
@@ -594,6 +653,9 @@ async def add_echo(
     visibility: str = Form("public"),
     filter_keywords: str = Form(""),
     filter_mode: str = Form("exclude"),
+    content_warning: str = Form(""),
+    attach_image: str = Form(""),
+    delivery_mode: str = Form("instant"),
     enabled: str = Form(""),
 ):
     if destination_type not in VALID_DEST_TYPES:
@@ -602,6 +664,11 @@ async def add_echo(
         raise HTTPException(status_code=400, detail=f"Invalid visibility")
     if filter_mode not in VALID_FILTER_MODES:
         raise HTTPException(status_code=400, detail=f"Invalid filter mode")
+    if delivery_mode not in ("instant", "digest"):
+        raise HTTPException(status_code=400, detail="Invalid delivery mode")
+    # Digest mode is email-only
+    if delivery_mode == "digest" and destination_type != "email":
+        raise HTTPException(status_code=400, detail="Digest mode is only available for email destinations")
 
     # Resolve destination_id based on type
     if destination_type == "mastodon":
@@ -614,13 +681,16 @@ async def add_echo(
             raise HTTPException(status_code=400, detail="email_account_id required for email destination")
 
     is_enabled = 1 if enabled else 0
+    is_attach_image = 1 if attach_image else 0
     with get_db() as db:
         db.execute(
             """INSERT INTO echoes (feed_id, destination_type, destination_id, template, visibility,
-                                   filter_keywords, filter_mode, enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   filter_keywords, filter_mode, content_warning, attach_image,
+                                   delivery_mode, enabled)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (feed_id, destination_type, destination_id, template, visibility,
-             filter_keywords.strip(), filter_mode, is_enabled),
+             filter_keywords.strip(), filter_mode, content_warning.strip(), is_attach_image,
+             delivery_mode, is_enabled),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 
@@ -647,6 +717,9 @@ async def edit_echo(
     visibility: str = Form("public"),
     filter_keywords: str = Form(""),
     filter_mode: str = Form("exclude"),
+    content_warning: str = Form(""),
+    attach_image: str = Form(""),
+    delivery_mode: str = Form("instant"),
     enabled: str = Form(""),
 ):
     if destination_type not in VALID_DEST_TYPES:
@@ -655,6 +728,10 @@ async def edit_echo(
         raise HTTPException(status_code=400, detail=f"Invalid visibility")
     if filter_mode not in VALID_FILTER_MODES:
         raise HTTPException(status_code=400, detail=f"Invalid filter mode")
+    if delivery_mode not in ("instant", "digest"):
+        raise HTTPException(status_code=400, detail="Invalid delivery mode")
+    if delivery_mode == "digest" and destination_type != "email":
+        raise HTTPException(status_code=400, detail="Digest mode is only available for email destinations")
 
     if destination_type == "mastodon":
         destination_id = account_id
@@ -666,16 +743,19 @@ async def edit_echo(
             raise HTTPException(status_code=400, detail="email_account_id required for email destination")
 
     is_enabled = 1 if enabled else 0
+    is_attach_image = 1 if attach_image else 0
     with get_db() as db:
         echo = db.execute("SELECT * FROM echoes WHERE id = ?", (echo_id,)).fetchone()
         if not echo:
             raise HTTPException(status_code=404, detail="Echo not found")
         db.execute(
             """UPDATE echoes SET feed_id = ?, destination_type = ?, destination_id = ?,
-               template = ?, visibility = ?, filter_keywords = ?, filter_mode = ?, enabled = ?
+               template = ?, visibility = ?, filter_keywords = ?, filter_mode = ?,
+               content_warning = ?, attach_image = ?, delivery_mode = ?, enabled = ?
                WHERE id = ?""",
             (feed_id, destination_type, destination_id, template, visibility,
-             filter_keywords.strip(), filter_mode, is_enabled, echo_id),
+             filter_keywords.strip(), filter_mode, content_warning.strip(), is_attach_image,
+             delivery_mode, is_enabled, echo_id),
         )
     return RedirectResponse(url="/echoes", status_code=303)
 

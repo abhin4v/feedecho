@@ -281,6 +281,7 @@ h2 { font-size: 1.1rem; margin: 1.25rem 0 0.5rem; }
 }
 .badge-success { background: var(--success-wash); color: var(--success); }
 .badge-danger { background: var(--danger-wash); color: var(--danger); }
+.badge-info { background: var(--accent-wash); color: var(--accent); }
 .badge-warning { background: var(--warning-wash); color: var(--warning); }
 .badge-muted { background: var(--surface-light); color: var(--text-muted); }
 

@@ -11,9 +11,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from database import get_db
 from email_sender import send_email
-from feed_parser import fetch_feed, get_new_items, truncate
+from feed_parser import fetch_feed, fetch_image, get_new_items, truncate
 from filters import is_filtered
-from mastodon import post_status
+from mastodon import post_status, upload_media
 from notify import (
     max_attempts,
     next_retry_delay,
@@ -21,6 +21,7 @@ from notify import (
     record_success,
 )
 from template_engine import render_template
+import alt_text
 
 logger = logging.getLogger("feedecho.scheduler")
 
@@ -380,13 +381,15 @@ def _row_state(echo_id: int, item_id: str) -> str | None:
 def _post_succeeded(echo_id: int, item_id: str) -> bool:
     """True when the item is in a terminal state for this echo.
 
-    'success', 'filtered', and 'gave_up' all count as handled: they must not
-    be retried and must not block cursor advancement. A 'failed' row waiting
-    out its retry backoff returns False here — it still gates the cursor —
-    but process_echo distinguishes it from a fresh failure via _row_state so
-    the run stops quietly instead of logging new failures.
+    'success', 'filtered', 'gave_up', and 'queued' all count as handled:
+    they must not be retried and must not block cursor advancement.
+    'queued' means the item is waiting for digest flush.
+    A 'failed' row waiting out its retry backoff returns False here —
+    it still gates the cursor — but process_echo distinguishes it from
+    a fresh failure via _row_state so the run stops quietly instead of
+    logging new failures.
     """
-    return _row_state(echo_id, item_id) in ("success", "filtered", "gave_up")
+    return _row_state(echo_id, item_id) in ("success", "filtered", "gave_up", "queued")
 
 
 def _record_filtered(echo_id: int, item: dict) -> None:
@@ -569,12 +572,78 @@ def _send_mastodon(
             posted_id, claim_token, echo["id"], f"Account {account_id} not found"
         )
 
+    # Content warning: per-echo CW text, applied via Mastodon's spoiler_text
+    try:
+        cw_text = (echo["content_warning"] or "").strip()
+    except (KeyError, IndexError):
+        cw_text = ""
+    sensitive = bool(cw_text)
+
+    # Image attachment: if enabled, extract and upload the item's first image
+    media_ids: list[str] = []
+    try:
+        attach_image = bool(echo["attach_image"])
+    except (KeyError, IndexError):
+        attach_image = False
+
+    if attach_image:
+        image_url = item.get("image_url", "")
+        if image_url:
+            image_result = fetch_image(image_url)
+            if image_result:
+                img_bytes, img_type = image_result
+                description = ""
+                if alt_text.is_enabled():
+                    try:
+                        description = alt_text.generate_alt_text(img_bytes, img_type)
+                        if description:
+                            logger.info(
+                                "Echo %s: generated alt text for item %s (%d chars)",
+                                echo["id"], item["id"], len(description),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Echo %s: alt text generation failed for item %s",
+                            echo["id"], item["id"],
+                            exc_info=True,
+                        )
+                uploaded = upload_media(
+                    instance=account["instance"],
+                    access_token=account["access_token"],
+                    image_bytes=img_bytes,
+                    content_type=img_type,
+                    description=description,
+                )
+                if uploaded and uploaded.get("id"):
+                    media_ids.append(str(uploaded["id"]))
+                    logger.info(
+                        "Echo %s: uploaded image %s for item %s",
+                        echo["id"],
+                        uploaded["id"],
+                        item["id"],
+                    )
+                else:
+                    logger.warning(
+                        "Echo %s: image upload failed for item %s, posting text-only",
+                        echo["id"],
+                        item["id"],
+                    )
+            else:
+                logger.info(
+                    "Echo %s: image fetch failed or invalid for item %s, posting text-only",
+                    echo["id"],
+                    item["id"],
+                )
+
     try:
         post_status(
             instance=account["instance"],
             access_token=account["access_token"],
             content=truncate(content, MASTODON_MAX_CHARS),
             visibility=echo["visibility"],
+            sensitive=sensitive,
+            spoiler_text=cw_text,
+            media_ids=media_ids or None,
         )
     except Exception:
         logger.exception("Echo %s: Mastodon post failed", echo["id"])
@@ -594,6 +663,16 @@ def _send_email_echo(
     posted_id: int,
     claim_token: str,
 ) -> bool:
+    # Check if this echo is in digest mode — if so, queue for later sending
+    try:
+        delivery_mode = echo["delivery_mode"]
+    except (KeyError, IndexError):
+        delivery_mode = "instant"
+
+    if delivery_mode == "digest":
+        return _queue_for_digest(echo, item, content, posted_id, claim_token)
+
+    # Instant mode: send immediately
     with get_db() as db:
         account = db.execute(
             "SELECT * FROM email_accounts WHERE id = ?",
@@ -625,6 +704,137 @@ def _send_email_echo(
     if ok:
         record_success(echo["id"])
     return ok
+
+
+def _queue_for_digest(
+    echo,
+    item: dict,
+    content: str,
+    posted_id: int,
+    claim_token: str,
+) -> bool:
+    """Queue an item for digest delivery instead of sending immediately.
+
+    Inserts into digest_items and marks the posted_item as 'queued' so the
+    cursor advances and the item isn't retried. The digest flush job sends
+    all queued items for this echo as one email.
+    """
+    echo_id = echo["id"]
+    item_id = item["id"]
+
+    with get_db() as db:
+        db.execute(
+            """INSERT INTO digest_items (echo_id, item_id, item_title, item_url, rendered_content)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(echo_id, item_id) DO NOTHING""",
+            (echo_id, item_id, item.get("title", ""), item.get("link", ""), content),
+        )
+
+    # Mark the posted_item as 'queued' — the digest job will finalize it
+    ok = _update_post(posted_id, claim_token, "queued")
+    if ok:
+        record_success(echo_id)
+        logger.info(
+            "Echo %s: item %s queued for digest delivery",
+            echo_id,
+            item_id,
+        )
+    return ok
+
+
+def flush_digests() -> None:
+    """Send pending digest items as batched emails and finalize them.
+
+    Called by the digest scheduler job at the configured interval.
+    Groups digest_items by echo, sends one email per echo, then
+    deletes the items from digest_items and updates posted_items
+    from 'queued' to 'success'.
+    """
+    with get_db() as db:
+        # Find all echoes that have pending digest items
+        pending_echoes = db.execute("""
+            SELECT DISTINCT d.echo_id, e.destination_id, e.feed_id,
+                   f.name as feed_name, ea.email as to_email
+              FROM digest_items d
+              JOIN echoes e ON d.echo_id = e.id
+              JOIN feeds f ON e.feed_id = f.id
+              JOIN email_accounts ea ON e.destination_id = ea.id
+             WHERE e.destination_type = 'email'
+               AND e.delivery_mode = 'digest'
+               AND e.enabled = 1
+        """).fetchall()
+
+    if not pending_echoes:
+        return
+
+    for echo_row in pending_echoes:
+        echo_id = echo_row["echo_id"]
+        with get_db() as db:
+            items = db.execute(
+                "SELECT * FROM digest_items WHERE echo_id = ? ORDER BY created_at ASC",
+                (echo_id,),
+            ).fetchall()
+
+        if not items:
+            continue
+
+        # Build digest body
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        subject = f"FeedEcho Digest — {echo_row['feed_name']} — {date_str}"
+
+        body_parts = [f"FeedEcho Digest for {echo_row['feed_name']}", f"Date: {date_str}", ""]
+
+        for i, item in enumerate(items, 1):
+            title = item["item_title"] or item["item_url"] or f"Item {i}"
+            body_parts.append(f"{i}. {title}")
+            body_parts.append(f"   {item['rendered_content']}")
+            body_parts.append("")
+
+        # Truncate overly long digests
+        body = "\n".join(body_parts)
+        if len(body) > 10000:  # reasonable email size cap
+            body = body[:9950] + "\n\n... (truncated)"
+
+        try:
+            send_email(
+                to_email=echo_row["to_email"],
+                subject=subject,
+                body=body,
+            )
+        except Exception:
+            logger.exception(
+                "Digest flush failed for echo %s (%s, %d items)",
+                echo_id,
+                echo_row["feed_name"],
+                len(items),
+            )
+            # Don't mark as sent — leave items in digest_items for next run
+            continue
+
+        # Success — delete only the sent items and update posted_items to 'success'
+        sent_item_ids = [item["item_id"] for item in items]
+        with get_db() as db:
+            for item in items:
+                # Update posted_items from 'queued' to 'success'
+                db.execute(
+                    """UPDATE posted_items SET status = 'success', posted_at = CURRENT_TIMESTAMP
+                       WHERE echo_id = ? AND item_id = ? AND status = 'queued'""",
+                    (echo_id, item["item_id"]),
+                )
+            # Delete only the sent items, not any that may have arrived concurrently
+            placeholders = ",".join("?" for _ in sent_item_ids)
+            db.execute(
+                f"DELETE FROM digest_items WHERE echo_id = ? AND item_id IN ({placeholders})",
+                (echo_id, *sent_item_ids),
+            )
+
+        record_success(echo_id)
+        logger.info(
+            "Digest flushed for echo %s (%s): %d items sent",
+            echo_id,
+            echo_row["feed_name"],
+            len(items),
+        )
 
 
 def check_all_feeds() -> None:
@@ -660,6 +870,18 @@ def start_scheduler() -> None:
     )
     scheduler.start()
     scheduler.add_job(check_all_feeds, "date", id="startup_check", replace_existing=True)
+
+    # Digest flush job — runs hourly, checks for pending digest items
+    scheduler.add_job(
+        flush_digests,
+        trigger=IntervalTrigger(hours=1),
+        id="flush_digests",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # Run a digest flush shortly after startup
+    scheduler.add_job(flush_digests, "date", id="startup_digest_flush", replace_existing=True)
 
 
 def stop_scheduler() -> None:

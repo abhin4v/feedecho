@@ -73,6 +73,25 @@
             </select>
         </label>
     </div>
+    <div class="form-row">
+        <label>Content warning
+            <input type="text" name="content_warning" placeholder="e.g. Spoilers, US Politics" maxlength="500">
+            <span class="hint" style="margin: 0.2rem 0 0;">Optional. Applied as Mastodon spoiler text; hides post body behind the warning.</span>
+        </label>
+        <label>Attach image
+            <input type="checkbox" name="attach_image" value="true">
+            <span class="hint" style="margin: 0.2rem 0 0;">Upload the feed item's first image as a media attachment. Mastodon only.</span>
+        </label>
+    </div>
+    <div class="form-row" id="digest-fields" style="display: none;">
+        <label>Delivery mode
+            <select name="delivery_mode">
+                <option value="instant">Instant (one email per item)</option>
+                <option value="digest">Digest (batch items into one email, sent hourly)</option>
+            </select>
+            <span class="hint" style="margin: 0.2rem 0 0;">Digest mode batches items into a single email instead of sending each one immediately. Email destinations only.</span>
+        </label>
+    </div>
     <details class="template-vars">
         <summary>Available template variables</summary>
         <table class="vars-table">
@@ -110,6 +129,9 @@
             data-visibility="{{ echo.visibility }}"
             data-filter-keywords="{{ echo.filter_keywords | e }}"
             data-filter-mode="{{ echo.filter_mode }}"
+            data-content-warning="{{ echo.content_warning | e if echo.content_warning else '' }}"
+            data-attach-image="{{ echo.attach_image }}"
+            data-delivery-mode="{{ echo.delivery_mode }}"
             data-enabled="{{ echo.enabled }}">
             <td data-label="Feed">{{ echo.feed_name }}</td>
             <td data-label="Destination">
@@ -119,9 +141,18 @@
                 <span class="badge badge-success">Email</span> {{ echo.destination_name }}
                 {% endif %}
                 {% if echo.filter_keywords %}
-                <br><span class="badge badge-warning" title="{{ echo.filter_keywords | e }}">
+                <br><span class="badge badge-warning" title="Filter keywords: {{ echo.filter_keywords | e }}">
                     {{ 'only' if echo.filter_mode == 'include' else 'not' }}: {{ echo.filter_keywords }}
                 </span>
+                {% endif %}
+                {% if echo.content_warning %}
+                <br><span class="badge badge-muted" title="Content warning">CW: {{ echo.content_warning }}</span>
+                {% endif %}
+                {% if echo.attach_image %}
+                <br><span class="badge badge-info">IMG</span>
+                {% endif %}
+                {% if echo.destination_type == 'email' and echo.delivery_mode == 'digest' %}
+                <br><span class="badge badge-info">DIGEST</span>
                 {% endif %}
             </td>
             <td data-label="Visibility">{{ echo.visibility }}</td>
@@ -164,6 +195,8 @@ function toggleDestFields() {
     const destType = document.getElementById('destination-type').value;
     document.getElementById('mastodon-fields').style.display = destType === 'mastodon' ? '' : 'none';
     document.getElementById('email-fields').style.display = destType === 'email' ? '' : 'none';
+    const digestFields = document.getElementById('digest-fields');
+    if (digestFields) digestFields.style.display = destType === 'email' ? '' : 'none';
 }
 toggleDestFields();
 </script>

@@ -13,6 +13,10 @@ Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echo
 - **Per-feed poll intervals** — each feed checked on its own schedule
 - **Post history** with success/failure tracking and error messages
 - **Visibility settings** — public, unlisted, private, direct
+- **Content warnings** — per-echo CW text applied as Mastodon spoiler text
+- **Image attachments** — automatically upload the feed item's first image (Mastodon only)
+- **AI alt text** — optionally generate image descriptions via an OpenAI-compatible vision API
+- **Digest mode** — batch email deliveries into hourly digests instead of one email per item
 - **Mobile-responsive** — tables convert to cards, forms stack, 44px touch targets
 - **Idempotent posting** — failed posts are retried, duplicates are prevented
 - **Auto-initialization** — feeds set their baseline on first fetch, no manual init needed
