@@ -17,7 +17,7 @@
         in
         python.pkgs.buildPythonApplication {
           pname = "feedecho";
-          version = "1.9.0";
+          version = "1.9.1";
           src = ./.;
           format = "pyproject";
 
@@ -62,7 +62,7 @@
           };
 
           meta = with pkgs.lib; {
-            description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon";
+            description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon, Bluesky, or email";
             homepage = "https://github.com/jcrabapple/feedecho";
             license = licenses.mit;
             mainProgram = "uvicorn";

@@ -9,12 +9,12 @@
 
 pythonPkg.pkgs.buildPythonApplication {
   pname = "feedecho";
-  version = "1.9.0";
+  version = "1.9.1";
 
   src = if src != null then src else fetchFromGitHub {
     owner = "jcrabapple";
     repo = "feedecho";
-    rev = "v1.9.0";
+    rev = "v1.9.1";
     hash = lib.fakeHash; # replace after first build: `nix-prefetch-url --unpack <url>`
   };
 
@@ -60,9 +60,11 @@ pythonPkg.pkgs.buildPythonApplication {
   };
 
   meta = with lib; {
-    description = "Self-hosted RSS feed cross-poster";
+    description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon, Bluesky, or email";
     homepage = "https://github.com/jcrabapple/feedecho";
     license = licenses.mit;
+    # The wheel ships no console script; the module execs uvicorn from the
+    # passthru.env runtime environment instead of the package's own bin.
     mainProgram = "uvicorn";
     platforms = platforms.linux ++ platforms.darwin;
   };
