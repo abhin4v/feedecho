@@ -11,7 +11,7 @@
 # Then `nixos-rebuild switch`. The app runs on port 8453 by default.
 # Put a reverse proxy (nginx, caddy) in front for TLS.
 
-{ config, lib, pkgs }:
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.services.feedecho;
@@ -27,6 +27,16 @@ let
       "${cfg.package}/lib/${cfg.package.python.libPrefix}/site-packages"
     else
       "${cfg.package}/lib/python3.12/site-packages";
+
+  # The wheel does not ship a console script, so exec uvicorn from the
+  # package's consolidated runtime env (uvicorn + all deps).
+  uvicornBin =
+    if cfg.package ? env then
+      "${cfg.package.env}/bin/uvicorn"
+    else if cfg.package ? python then
+      "${cfg.package.python.pkgs.uvicorn}/bin/uvicorn"
+    else
+      "${pkgs.python3.pkgs.uvicorn}/bin/uvicorn";
 in {
   options.services.feedecho = {
     enable = lib.mkEnableOption "FeedEcho RSS feed cross-poster";
@@ -103,19 +113,58 @@ in {
 
         # Hardening
         NoNewPrivileges = true;
+
+        # Process isolation
+        PrivateMounts = true;
         PrivateTmp = true;
-        ProtectSystem = "strict";
+        RemoveIPC = true;
+
+        # Filesystem
         ProtectHome = true;
+        ProtectSystem = "strict";
+        UMask = "0077";
+
+        # Kernel
+        ProtectClock = true;
+        ProtectControlGroups = true;
+        ProtectHostname = true;
+        ProtectKernelLogs = true;
+        ProtectKernelModules = true;
+        ProtectKernelTunables = true;
+        ProtectProc = "invisible";
+
+        # Capabilities
+        AmbientCapabilities = [ ];
+        CapabilityBoundingSet = [ ];
+        RestrictSUIDSGID = true;
+
+        # Memory
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+
+        # Devices
+        PrivateDevices = true;
+
+        # Network
+        # HTTP(S) and Unix sockets for the web UI, outbound feed/API polling,
+        # SMTP, and DNS resolution via the resolver socket.
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ];
+
+        # Misc
+        KeyringMode = "private";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
       };
 
       # Read the auth token from the credential file and exec uvicorn.
-      # We cd into site-packages so app.py, templates/, and static/ are
-      # all resolvable. The path is derived from the package's Python
-      # interpreter to avoid hardcoding a version.
+      # app.py, templates/, and static/ live in the package's own
+      # site-packages; uvicorn and the app's dependencies live in the
+      # consolidated runtime env. Put both on PYTHONPATH so the "app"
+      # import resolves.
       script = ''
-        cd "${pythonSitePackages}"
         export FEEDCHO_AUTH_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/auth_token")
-        exec ${cfg.package}/bin/uvicorn app:app --host 0.0.0.0 --port ${toString cfg.port}
+        export PYTHONPATH="${pythonSitePackages}:$PYTHONPATH"
+        exec ${uvicornBin} app:app --host 0.0.0.0 --port ${toString cfg.port}
       '';
     };
   };
