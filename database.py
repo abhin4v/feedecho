@@ -159,6 +159,21 @@ def init_db() -> None:
         """)
 
         db.execute("""
+            CREATE TABLE IF NOT EXISTS bluesky_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                handle TEXT NOT NULL UNIQUE,
+                app_password TEXT NOT NULL,
+                did TEXT DEFAULT '',
+                pds TEXT DEFAULT '',
+                access_jwt TEXT DEFAULT '',
+                refresh_jwt TEXT DEFAULT '',
+                session_expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT

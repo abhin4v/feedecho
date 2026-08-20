@@ -14,6 +14,21 @@ from email_sender import send_email
 from feed_parser import fetch_feed, fetch_image, get_new_items, truncate
 from filters import is_filtered
 from mastodon import post_status, upload_media
+from bluesky import (
+    BLUESKY_IMAGE_TYPES,
+    MAX_BLOB_BYTES,
+    BlueskyAuthError,
+    BlueskyError,
+    build_facets,
+    build_image_embed,
+    create_post,
+    create_session,
+    refresh_session,
+    resolve_pds,
+    session_expiry,
+    truncate_graphemes,
+    upload_blob,
+)
 from notify import (
     max_attempts,
     next_retry_delay,
@@ -28,6 +43,7 @@ logger = logging.getLogger("feedecho.scheduler")
 scheduler: BackgroundScheduler | None = None
 
 MASTODON_MAX_CHARS = 500
+BLUESKY_MAX_GRAPHEMES = 300
 PENDING_RECLAIM_SECONDS = 10 * 60
 FEED_LEASE_SECONDS = 15 * 60
 
@@ -465,6 +481,16 @@ def process_echo(echo, item: dict) -> bool:
             claim_token,
         )
 
+    if echo["destination_type"] == "bluesky":
+        return _send_bluesky(
+            echo,
+            item,
+            content,
+            echo["destination_id"],
+            posted_id,
+            claim_token,
+        )
+
     gave_up = _fail_post(
         posted_id,
         claim_token,
@@ -699,6 +725,211 @@ def _send_email_echo(
     except Exception:
         logger.exception("Echo %s: email delivery failed", echo["id"])
         return _fail_post(posted_id, claim_token, echo["id"], "Email delivery failed")
+
+    ok = _update_post(posted_id, claim_token, "success")
+    if ok:
+        record_success(echo["id"])
+    return ok
+
+
+def _bsky_session(db, account) -> dict:
+    """Return a usable Bluesky session, caching JWTs in the account row.
+
+    Resolves the account's PDS when unknown, reuses a cached access JWT while
+    unexpired, refreshes via the refresh JWT when possible, and falls back to
+    a fresh app-password login otherwise.
+    """
+    handle = account["handle"]
+    app_password = account["app_password"]
+    pds = (account["pds"] or "").strip()
+    access_jwt = (account["access_jwt"] or "").strip()
+    refresh_jwt = (account["refresh_jwt"] or "").strip()
+    now = _now()
+
+    if not pds:
+        did, pds = resolve_pds(handle)
+
+    if access_jwt:
+        expires_at = account["session_expires_at"] or ""
+        if expires_at and expires_at > now:
+            return {
+                "pds": pds,
+                "did": (account["did"] or "").strip(),
+                "access_jwt": access_jwt,
+            }
+
+    session = None
+    if refresh_jwt:
+        try:
+            session = refresh_session(pds, refresh_jwt)
+        except BlueskyError:
+            # Auth or network failure — fall through to a fresh login.
+            session = None
+    if session is None:
+        session = create_session(pds, handle, app_password)
+
+    db.execute(
+        """
+        UPDATE bluesky_accounts
+           SET did = ?, pds = ?, access_jwt = ?, refresh_jwt = ?,
+               session_expires_at = ?
+         WHERE id = ?
+        """,
+        (
+            session["did"],
+            pds,
+            session["access_jwt"],
+            session["refresh_jwt"],
+            session_expiry(session["access_jwt"]),
+            account["id"],
+        ),
+    )
+    return {
+        "pds": pds,
+        "did": session["did"],
+        "access_jwt": session["access_jwt"],
+    }
+
+
+def _send_bluesky(
+    echo,
+    item: dict,
+    content: str,
+    account_id: int,
+    posted_id: int,
+    claim_token: str,
+) -> bool:
+    with get_db() as db:
+        account = db.execute(
+            "SELECT * FROM bluesky_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+
+    if not account:
+        return _fail_post(
+            posted_id, claim_token, echo["id"], f"Bluesky account {account_id} not found"
+        )
+
+    text = truncate_graphemes(content, BLUESKY_MAX_GRAPHEMES)
+    facets = build_facets(text)
+
+    try:
+        with get_db() as db:
+            session = _bsky_session(db, account)
+    except Exception:
+        logger.exception("Echo %s: Bluesky session failed", echo["id"])
+        return _fail_post(posted_id, claim_token, echo["id"], "Bluesky session failed")
+
+    # Image attachment: optional, single image, with AI alt text when enabled.
+    try:
+        attach_image = bool(echo["attach_image"])
+    except (KeyError, IndexError):
+        attach_image = False
+
+    image_blob = None
+    alt_description = ""
+    if attach_image:
+        image_url = item.get("image_url", "")
+        if image_url:
+            image_result = fetch_image(image_url)
+            if image_result:
+                img_bytes, img_type = image_result
+                if img_type in BLUESKY_IMAGE_TYPES and len(img_bytes) <= MAX_BLOB_BYTES:
+                    if alt_text.is_enabled():
+                        try:
+                            alt_description = (
+                                alt_text.generate_alt_text(img_bytes, img_type) or ""
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Echo %s: alt text generation failed for item %s",
+                                echo["id"],
+                                item["id"],
+                                exc_info=True,
+                            )
+                    blob = upload_blob(
+                        pds=session["pds"],
+                        access_jwt=session["access_jwt"],
+                        image_bytes=img_bytes,
+                        content_type=img_type,
+                    )
+                    if blob:
+                        image_blob = blob
+                        logger.info(
+                            "Echo %s: uploaded Bluesky image blob for item %s",
+                            echo["id"],
+                            item["id"],
+                        )
+                    else:
+                        logger.warning(
+                            "Echo %s: Bluesky image upload failed for item %s, posting text-only",
+                            echo["id"],
+                            item["id"],
+                        )
+                else:
+                    logger.info(
+                        "Echo %s: image unsupported for Bluesky (type=%s, size=%d), posting text-only",
+                        echo["id"],
+                        img_type,
+                        len(img_bytes),
+                    )
+            else:
+                logger.info(
+                    "Echo %s: image fetch failed for item %s, posting text-only",
+                    echo["id"],
+                    item["id"],
+                )
+
+    embed = build_image_embed(image_blob, alt_description) if image_blob else None
+
+    try:
+        create_post(
+            pds=session["pds"],
+            access_jwt=session["access_jwt"],
+            repo=session["did"],
+            text=text,
+            facets=facets or None,
+            embed=embed,
+        )
+    except BlueskyAuthError:
+        # Token was rejected (expired or revoked mid-flight). Re-authenticate
+        # once with the app password and retry the same payload.
+        try:
+            with get_db() as db:
+                refreshed = create_session(
+                    session["pds"], account["handle"], account["app_password"]
+                )
+                db.execute(
+                    """
+                    UPDATE bluesky_accounts
+                       SET did = ?, access_jwt = ?, refresh_jwt = ?,
+                           session_expires_at = ?
+                     WHERE id = ?
+                    """,
+                    (
+                        refreshed["did"],
+                        refreshed["access_jwt"],
+                        refreshed["refresh_jwt"],
+                        session_expiry(refreshed["access_jwt"]),
+                        account["id"],
+                    ),
+                )
+            create_post(
+                pds=session["pds"],
+                access_jwt=refreshed["access_jwt"],
+                repo=refreshed["did"],
+                text=text,
+                facets=facets or None,
+                embed=embed,
+            )
+        except Exception:
+            logger.exception("Echo %s: Bluesky post failed", echo["id"])
+            return _fail_post(
+                posted_id, claim_token, echo["id"], "Bluesky delivery failed"
+            )
+    except Exception:
+        logger.exception("Echo %s: Bluesky post failed", echo["id"])
+        return _fail_post(posted_id, claim_token, echo["id"], "Bluesky delivery failed")
 
     ok = _update_post(posted_id, claim_token, "success")
     if ok:

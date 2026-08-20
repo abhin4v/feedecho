@@ -1,7 +1,7 @@
 [project]
 name = "feedecho"
-version = "1.8.0"
-description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon"
+version = "1.9.0"
+description = "Self-hosted RSS feed cross-poster — route feed items to Mastodon, Bluesky, or email"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]

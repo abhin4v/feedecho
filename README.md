@@ -1,6 +1,6 @@
 # FeedEcho
 
-Self-hosted RSS feed cross-poster. Route items from RSS, Atom, and JSON feeds to Mastodon accounts using configurable templates.
+Self-hosted RSS feed cross-poster. Route items from RSS, Atom, and JSON feeds to Mastodon, Bluesky, and email using configurable templates.
 
 Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echofeed/), which shut down in August 2026.
 
@@ -8,19 +8,20 @@ Built as a replacement for [Echofeed](https://rknight.me/blog/shutting-down-echo
 
 - **RSS/Atom/JSON feed support** via feedparser
 - **Mastodon OAuth** — connect accounts with one click, no manual token creation
+- **Bluesky support** — connect accounts with an App Password; posts get auto-detected link facets, 300-grapheme truncation, and image embeds with alt text
 - **Template engine** with variables: `{{ title }}`, `{{ link }}`, `{{ summary }}`, `{{ content }}`, `{{ author }}`, `{{ date }}`, `{{ date:iso }}`, `{{ date:short }}`, `{{ hashtags }}`
-- **Multiple accounts** — post to multiple Mastodon instances
+- **Multiple accounts** — post to multiple Mastodon instances and Bluesky accounts
 - **Per-feed poll intervals** — each feed checked on its own schedule
 - **Post history** with success/failure tracking and error messages
-- **Visibility settings** — public, unlisted, private, direct
+- **Visibility settings** — public, unlisted, private, direct (Mastodon)
 - **Content warnings** — per-echo CW text applied as Mastodon spoiler text
-- **Image attachments** — automatically upload the feed item's first image (Mastodon only)
+- **Image attachments** — automatically upload the feed item's first image (Mastodon and Bluesky)
 - **AI alt text** — optionally generate image descriptions via an OpenAI-compatible vision API
 - **Digest mode** — batch email deliveries into hourly digests instead of one email per item
 - **Mobile-responsive** — tables convert to cards, forms stack, 44px touch targets
 - **Idempotent posting** — failed posts are retried, duplicates are prevented
 - **Auto-initialization** — feeds set their baseline on first fetch, no manual init needed
-- **Email destination** — echo to email via SMTP in addition to Mastodon
+- **Email destination** — echo to email via SMTP in addition to Mastodon and Bluesky
 
 ## Tech Stack
 
@@ -130,9 +131,18 @@ FeedEcho ships a Nix flake and a NixOS module. See [`nix/README.md`](nix/README.
 ## Usage
 
 1. **Add a Mastodon account** — Go to `/accounts`, enter your instance URL, click "Connect Account". OAuth handles the rest.
-2. **Add a feed** — Go to `/feeds`, paste an RSS/Atom/JSON feed URL.
-3. **Create an echo** — Go to `/echoes`, select a feed + account, write a template like `{{ title }} {{ link }}`.
-4. **Watch it run** — The scheduler checks feeds every 2 minutes and posts new items.
+2. **Add a Bluesky account** — Create an App Password in Bluesky (Settings → Privacy & Security → App Passwords), then enter your handle and the app password on `/accounts`. FeedEcho verifies the credentials, resolves your PDS, and caches a session.
+3. **Add a feed** — Go to `/feeds`, paste an RSS/Atom/JSON feed URL.
+4. **Create an echo** — Go to `/echoes`, select a feed + destination, write a template like `{{ title }} {{ link }}`.
+5. **Watch it run** — The scheduler checks feeds every 2 minutes and posts new items.
+
+### Bluesky details
+
+- Accounts connect via **App Passwords**, which are scoped to creating posts (and other app activity) and can be revoked individually without changing your main password.
+- Sessions are cached per account (access + refresh JWTs in SQLite) and refreshed automatically; expired tokens trigger a transparent re-login and one retry.
+- Posts are truncated to **300 graphemes** (Unicode-aware) and URLs in the text get proper link facets, so links are clickable everywhere.
+- Image attachments upload through the PDS blob API with an `app.bsky.embed.images` embed; alt text uses your AI vision config when enabled. Images are capped at 1 MB and jpeg/png/webp/gif (Bluesky's limits).
+- Content warnings and visibility settings are Mastodon-only and are ignored for Bluesky posts.
 
 ## Template Variables
 
@@ -156,9 +166,9 @@ FeedEcho is ~1,600 lines of Python across 8 modules. No framework magic, no ORMs
 
 The FastAPI application. Defines every HTTP route: dashboard, feed CRUD, account management, echo CRUD, post history, settings, and the OAuth callback endpoints. Renders Jinja2 templates server-side. Also starts/stops the background scheduler on app startup/shutdown. This is the only module that talks to the user's browser.
 
-### `database.py` (124 lines) — SQLite layer
+### `database.py` (143 lines) — SQLite layer
 
-Creates and manages 7 tables: `accounts` (Mastodon connections), `feeds` (RSS sources), `echoes` (feed-to-destination mappings), `email_accounts`, `settings` (key-value config like SMTP), `posted_items` (post history with status tracking), and `oauth_apps` (cached OAuth client credentials per instance). Uses SQLite WAL mode for concurrent read/write. Includes lightweight migrations (column additions, schema resets) so existing databases upgrade in place. The unique index on `posted_items(echo_id, item_id)` enforces the pending-row dedup pattern.
+Creates and manages 8 tables: `accounts` (Mastodon connections), `feeds` (RSS sources), `echoes` (feed-to-destination mappings), `email_accounts`, `bluesky_accounts` (Bluesky handles, app passwords, DID/PDS, and cached session JWTs), `settings` (key-value config like SMTP), `posted_items` (post history with status tracking), and `oauth_apps` (cached OAuth client credentials per instance). Uses SQLite WAL mode for concurrent read/write. Includes lightweight migrations (column additions, schema resets) so existing databases upgrade in place. The unique index on `posted_items(echo_id, item_id)` enforces the pending-row dedup pattern.
 
 ### `feed_parser.py` (212 lines) — Feed fetching and normalization
 
@@ -171,6 +181,10 @@ The core dispatch engine. Runs on APScheduler (every 2 minutes). For each due fe
 ### `mastodon.py` (67 lines) — Mastodon API client
 
 Thin httpx wrapper around three Mastodon REST endpoints: `POST /api/v1/statuses` (post), `GET /api/v1/accounts/verify_credentials` (validate token), and the connection test helper. No state, no caching, no surprises.
+
+### `bluesky.py` — Bluesky (AT Protocol) client
+
+Handles the Bluesky side: handle normalization, DID/PDS discovery (`resolveHandle` + PLC directory, with SSRF validation on resolved endpoints), app-password sessions (`createSession` / `refreshSession`), blob uploads, and `createRecord` posts. Includes URL facet building with UTF-8 byte offsets, Unicode grapheme-aware truncation for the 300-grapheme limit, and `app.bsky.embed.images` embeds with alt text.
 
 ### `oauth.py` (110 lines) — Mastodon OAuth 2.0 flow
 
@@ -192,13 +206,13 @@ Sends rendered template content as plain-text email. Reads SMTP config (host, po
 
 `style.css` (mobile-responsive, table-to-card at 640px breakpoint) and `app.js` (inline echo editing, account test buttons, feed preview). Vanilla JS, no frameworks, no build step.
 
-### `tests/` — 62 pytest tests
+### `tests/` — 197 pytest tests
 
-Four test modules covering the database layer, feed parser (item detection, HTML stripping, truncation, date parsing), template engine (variable substitution, date formatting, hashtag generation), and security features (SSRF protection, OAuth state signing).
+Test modules covering the database layer, feed parser (item detection, HTML stripping, truncation, date parsing), template engine (variable substitution, date formatting, hashtag generation), security features (SSRF protection, OAuth state signing), content warnings and image attachments, digest delivery, retry/notification logic, and Bluesky integration (handle normalization, grapheme truncation, facets, session caching, dispatch, and account API routes).
 
 ## Security
 
-FeedEcho handles OAuth tokens and posts to your Mastodon accounts. Here's what it does and doesn't do:
+FeedEcho handles OAuth tokens, Bluesky app passwords, and posts to your connected accounts. Here's what it does and doesn't do:
 
 ### SSRF protection
 
@@ -226,6 +240,7 @@ The OAuth callback endpoints (`/oauth/connect`, `/oauth/callback`) are exempt fr
 ### Secrets handling
 
 - **Mastodon OAuth tokens** are stored in the SQLite database (`accounts.access_token`). The database file is local to the server. There is no encryption at rest — if an attacker gains filesystem access, they can read the tokens.
+- **Bluesky app passwords** are stored in the SQLite database (`bluesky_accounts.app_password`), along with cached session JWTs. App passwords can only create posts (and other app-level actions) and are revoked individually in Bluesky settings — they never expose the account's main password. Same at-rest caveat as Mastodon tokens.
 - **SMTP passwords** are stored in the `settings` table in plaintext. They are **masked** (`********`) when sent to the browser on the settings and accounts pages. The save endpoint skips password updates when the mask placeholder is submitted, so the existing password is preserved.
 - **OAuth client secrets** (per-instance app credentials) are cached in the `oauth_apps` table in plaintext.
 - FeedEcho **does not** log tokens, passwords, or secrets to the application log. Log messages contain echo IDs, feed names, and error messages only.

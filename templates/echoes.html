@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Echoes</h1>
 
-<p class="hint">An Echo routes items from a Feed to a destination (Mastodon or email) using a template.</p>
+<p class="hint">An Echo routes items from a Feed to a destination (Mastodon, Bluesky, or email) using a template.</p>
 
 <form method="post" action="/api/echoes" class="echo-form">
     <div class="form-row">
@@ -21,6 +21,9 @@
                 {% endif %}
                 {% if email_accounts %}
                 <option value="email">Email Address</option>
+                {% endif %}
+                {% if bluesky_accounts %}
+                <option value="bluesky">Bluesky Account</option>
                 {% endif %}
             </select>
         </label>
@@ -47,6 +50,15 @@
             <select name="email_account_id">
                 {% for account in email_accounts %}
                 <option value="{{ account.id }}">{{ account.name }} ({{ account.email }})</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div class="form-row" id="bluesky-fields" style="display: none;">
+        <label>Bluesky Account
+            <select name="bluesky_account_id">
+                {% for account in bluesky_accounts %}
+                <option value="{{ account.id }}">@{{ account.handle }}</option>
                 {% endfor %}
             </select>
         </label>
@@ -80,7 +92,7 @@
         </label>
         <label>Attach image
             <input type="checkbox" name="attach_image" value="true">
-            <span class="hint" style="margin: 0.2rem 0 0;">Upload the feed item's first image as a media attachment. Mastodon only.</span>
+            <span class="hint" style="margin: 0.2rem 0 0;">Upload the feed item's first image as a media attachment. Mastodon and Bluesky only.</span>
         </label>
     </div>
     <div class="form-row" id="digest-fields" style="display: none;">
@@ -139,6 +151,8 @@
                 <span class="badge badge-success">Mastodon</span> <code>{{ echo.destination_name }}</code>
                 {% elif echo.destination_type == 'email' %}
                 <span class="badge badge-success">Email</span> {{ echo.destination_name }}
+                {% elif echo.destination_type == 'bluesky' %}
+                <span class="badge badge-info">Bluesky</span> <code>{{ echo.destination_name }}</code>
                 {% endif %}
                 {% if echo.filter_keywords %}
                 <br><span class="badge badge-warning" title="Filter keywords: {{ echo.filter_keywords | e }}">
@@ -155,7 +169,7 @@
                 <br><span class="badge badge-info">DIGEST</span>
                 {% endif %}
             </td>
-            <td data-label="Visibility">{{ echo.visibility }}</td>
+            <td data-label="Visibility">{{ '—' if echo.destination_type == 'bluesky' else echo.visibility }}</td>
             <td data-label="Status">
                 {% if echo.enabled %}
                 <span class="badge badge-success">Enabled</span>
@@ -189,12 +203,16 @@
 <script id="email-options" type="text/html">
     {% for a in email_accounts %}<option value="{{ a.id }}">{{ a.name }} ({{ a.email }})</option>{% endfor %}
 </script>
+<script id="bluesky-options" type="text/html">
+    {% for a in bluesky_accounts %}<option value="{{ a.id }}">@{{ a.handle }}</option>{% endfor %}
+</script>
 
 <script>
 function toggleDestFields() {
     const destType = document.getElementById('destination-type').value;
     document.getElementById('mastodon-fields').style.display = destType === 'mastodon' ? '' : 'none';
     document.getElementById('email-fields').style.display = destType === 'email' ? '' : 'none';
+    document.getElementById('bluesky-fields').style.display = destType === 'bluesky' ? '' : 'none';
     const digestFields = document.getElementById('digest-fields');
     if (digestFields) digestFields.style.display = destType === 'email' ? '' : 'none';
 }

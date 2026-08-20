@@ -13,6 +13,16 @@ async function testAccount(accountId) {
     }
 }
 
+async function testBlueskyAccount(accountId) {
+    try {
+        const resp = await fetch(`/api/bluesky-accounts/${accountId}/test`, { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || (data.success ? 'OK' : 'Failed'));
+    } catch (e) {
+        alert('Request failed: ' + e.message);
+    }
+}
+
 async function testFeed(feedId) {
     try {
         const resp = await fetch(`/api/feeds/${feedId}/test`, { method: 'POST' });
@@ -138,9 +148,11 @@ function editEcho(echoId) {
     const feedOpts = document.getElementById('feed-options').innerHTML;
     const mastoOpts = document.getElementById('mastodon-options').innerHTML;
     const emailOpts = document.getElementById('email-options').innerHTML;
+    const blueskyOpts = document.getElementById('bluesky-options').innerHTML;
 
     const mastoStyle = destType === 'mastodon' ? '' : 'display:none';
     const emailStyle = destType === 'email' ? '' : 'display:none';
+    const blueskyStyle = destType === 'bluesky' ? '' : 'display:none';
 
     row.innerHTML = `<td colspan="5">
         <form method="post" action="/api/echoes/${echoId}/edit" class="echo-edit-form">
@@ -152,6 +164,7 @@ function editEcho(echoId) {
                     <select name="destination_type" id="edit-dest-type-${echoId}" onchange="toggleEditDest(${echoId})">
                         ${mastoOpts ? '<option value="mastodon"' + (destType === 'mastodon' ? ' selected' : '') + '>Mastodon Account</option>' : ''}
                         ${emailOpts ? '<option value="email"' + (destType === 'email' ? ' selected' : '') + '>Email Address</option>' : ''}
+                        ${blueskyOpts ? '<option value="bluesky"' + (destType === 'bluesky' ? ' selected' : '') + '>Bluesky Account</option>' : ''}
                     </select>
                 </label>
             </div>
@@ -171,6 +184,11 @@ function editEcho(echoId) {
             <div class="form-row" id="edit-email-fields-${echoId}" style="${emailStyle}">
                 <label>Email Address
                     <select name="email_account_id">${emailOpts}</select>
+                </label>
+            </div>
+            <div class="form-row" id="edit-bluesky-fields-${echoId}" style="${blueskyStyle}">
+                <label>Bluesky Account
+                    <select name="bluesky_account_id">${blueskyOpts}</select>
                 </label>
             </div>
             <div class="form-row">
@@ -224,12 +242,15 @@ function editEcho(echoId) {
     if (mastoSelect) mastoSelect.value = destId;
     const emailSelect = row.querySelector('select[name="email_account_id"]');
     if (emailSelect) emailSelect.value = destId;
+    const blueskySelect = row.querySelector('select[name="bluesky_account_id"]');
+    if (blueskySelect) blueskySelect.value = destId;
 }
 
 function toggleEditDest(echoId) {
     const destType = document.getElementById(`edit-dest-type-${echoId}`).value;
     document.getElementById(`edit-mastodon-fields-${echoId}`).style.display = destType === 'mastodon' ? '' : 'none';
     document.getElementById(`edit-email-fields-${echoId}`).style.display = destType === 'email' ? '' : 'none';
+    document.getElementById(`edit-bluesky-fields-${echoId}`).style.display = destType === 'bluesky' ? '' : 'none';
     const digestFields = document.getElementById(`edit-digest-fields-${echoId}`);
     if (digestFields) digestFields.style.display = destType === 'email' ? '' : 'none';
 }

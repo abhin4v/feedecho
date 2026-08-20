@@ -20,6 +20,15 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from database import get_db, init_db
 from feed_parser import fetch_feed, SSRFError, validate_outbound_url
 from mastodon import test_connection, post_status, verify_credentials
+from bluesky import (
+    BlueskyAuthError,
+    BlueskyError,
+    create_session as bluesky_create_session,
+    normalize_handle as bluesky_normalize_handle,
+    resolve_pds as bluesky_resolve_pds,
+    session_expiry as bluesky_session_expiry,
+    test_connection as test_bluesky_connection,
+)
 from template_engine import render_template, available_variables
 from scheduler import start_scheduler, stop_scheduler, check_feed
 from oauth import get_authorize_url, exchange_code, verify_state
@@ -28,7 +37,7 @@ from email_sender import get_smtp_settings, test_smtp_connection
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger("feedecho")
 
-app = FastAPI(title="FeedEcho", version="1.8.0")
+app = FastAPI(title="FeedEcho", version="1.9.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -174,7 +183,7 @@ def _get_smtp_settings(mask_password: bool = False):
 
 
 def _get_all_accounts():
-    """Fetch both Mastodon and email accounts."""
+    """Fetch Mastodon, email, and Bluesky accounts."""
     with get_db() as db:
         mastodon = db.execute(
             "SELECT id, name, username, instance, created_at FROM accounts ORDER BY name"
@@ -182,7 +191,26 @@ def _get_all_accounts():
         email = db.execute(
             "SELECT id, name, email, created_at FROM email_accounts ORDER BY name"
         ).fetchall()
-    return mastodon, email
+        bluesky = db.execute(
+            "SELECT id, name, handle, did, pds, created_at FROM bluesky_accounts ORDER BY handle"
+        ).fetchall()
+    return mastodon, email, bluesky
+
+
+def _render_accounts_error(request: Request, message: str) -> HTMLResponse:
+    """Render the accounts page with an error banner."""
+    mastodon_accounts, email_accounts, bluesky_accounts = _get_all_accounts()
+    smtp_settings = _get_smtp_settings(mask_password=True)
+    return render(
+        "accounts.html",
+        request,
+        mastodon_accounts=mastodon_accounts,
+        email_accounts=email_accounts,
+        bluesky_accounts=bluesky_accounts,
+        smtp_configured=bool(smtp_settings.get("smtp_host")),
+        smtp_settings=smtp_settings,
+        error=message,
+    )
 
 
 # ── Pages ───────────────────────────────────────────────────────────────────
@@ -196,31 +224,47 @@ async def dashboard(request: Request):
         email_accounts = db.execute(
             "SELECT COUNT(*) as c FROM email_accounts"
         ).fetchone()["c"]
+        bluesky_accounts = db.execute(
+            "SELECT COUNT(*) as c FROM bluesky_accounts"
+        ).fetchone()["c"]
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
         echoes = db.execute("""
             SELECT e.*, f.name as feed_name,
                    CASE
                      WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
                      WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
+                     WHEN e.destination_type = 'bluesky' THEN '@' || b.handle
                    END as destination_name
             FROM echoes e
             JOIN feeds f ON e.feed_id = f.id
             LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
             LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
+            LEFT JOIN bluesky_accounts b ON e.destination_type = 'bluesky' AND e.destination_id = b.id
             ORDER BY e.created_at DESC
         """).fetchall()
         recent_posts = db.execute("""
             SELECT pi.*, f.name as feed_name,
-                   '@' || a.username || '@' || REPLACE(a.instance, 'https://', '') as account_name, a.instance
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
+                     WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
+                     WHEN e.destination_type = 'bluesky' THEN '@' || b.handle
+                   END as account_name,
+                   CASE
+                     WHEN e.destination_type = 'mastodon' THEN a.instance
+                     WHEN e.destination_type = 'email' THEN ea.email
+                     WHEN e.destination_type = 'bluesky' THEN b.pds
+                   END as instance
             FROM posted_items pi
             JOIN echoes e ON pi.echo_id = e.id
             JOIN feeds f ON e.feed_id = f.id
             LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
+            LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
+            LEFT JOIN bluesky_accounts b ON e.destination_type = 'bluesky' AND e.destination_id = b.id
             ORDER BY pi.posted_at DESC
             LIMIT 20
         """).fetchall()
         stats = {
-            "accounts": mastodon_accounts + email_accounts,
+            "accounts": mastodon_accounts + email_accounts + bluesky_accounts,
             "feeds": len(feeds),
             "echoes": len(echoes),
             "active_echoes": sum(1 for e in echoes if e["enabled"]),
@@ -245,12 +289,13 @@ async def feeds_page(request: Request):
 
 @app.get("/accounts", response_class=HTMLResponse)
 async def accounts_page(request: Request):
-    mastodon_accounts, email_accounts = _get_all_accounts()
+    mastodon_accounts, email_accounts, bluesky_accounts = _get_all_accounts()
     smtp_settings = _get_smtp_settings(mask_password=True)
     smtp_configured = bool(smtp_settings.get("smtp_host"))
     return render("accounts.html", request,
                   mastodon_accounts=mastodon_accounts,
                   email_accounts=email_accounts,
+                  bluesky_accounts=bluesky_accounts,
                   smtp_configured=smtp_configured,
                   smtp_settings=smtp_settings)
 
@@ -263,11 +308,13 @@ async def echoes_page(request: Request):
                    CASE
                      WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
                      WHEN e.destination_type = 'email' THEN ea.name || ' (' || ea.email || ')'
+                     WHEN e.destination_type = 'bluesky' THEN '@' || b.handle
                    END as destination_name
             FROM echoes e
             JOIN feeds f ON e.feed_id = f.id
             LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
             LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
+            LEFT JOIN bluesky_accounts b ON e.destination_type = 'bluesky' AND e.destination_id = b.id
             ORDER BY e.created_at DESC
         """).fetchall()
         feeds = db.execute("SELECT * FROM feeds ORDER BY name").fetchall()
@@ -277,9 +324,13 @@ async def echoes_page(request: Request):
         email_accounts = db.execute(
             "SELECT id, name, email FROM email_accounts ORDER BY name"
         ).fetchall()
+        bluesky_accounts = db.execute(
+            "SELECT id, name, handle FROM bluesky_accounts ORDER BY handle"
+        ).fetchall()
     return render("echoes.html", request, echoes=echoes, feeds=feeds,
                   mastodon_accounts=mastodon_accounts,
                   email_accounts=email_accounts,
+                  bluesky_accounts=bluesky_accounts,
                   template_vars=available_variables())
 
 
@@ -291,16 +342,19 @@ async def history_page(request: Request):
                    CASE
                      WHEN e.destination_type = 'mastodon' THEN '@' || a.username || '@' || REPLACE(a.instance, 'https://', '')
                      WHEN e.destination_type = 'email' THEN ea.name
+                     WHEN e.destination_type = 'bluesky' THEN '@' || b.handle
                    END as account_name,
                    CASE
                      WHEN e.destination_type = 'mastodon' THEN a.instance
                      WHEN e.destination_type = 'email' THEN ea.email
+                     WHEN e.destination_type = 'bluesky' THEN b.pds
                    END as instance
             FROM posted_items pi
             JOIN echoes e ON pi.echo_id = e.id
             JOIN feeds f ON e.feed_id = f.id
             LEFT JOIN accounts a ON e.destination_type = 'mastodon' AND e.destination_id = a.id
             LEFT JOIN email_accounts ea ON e.destination_type = 'email' AND e.destination_id = ea.id
+            LEFT JOIN bluesky_accounts b ON e.destination_type = 'bluesky' AND e.destination_id = b.id
             ORDER BY pi.posted_at DESC
             LIMIT 100
         """).fetchall()
@@ -395,6 +449,90 @@ async def add_email_account(
 async def delete_email_account(account_id: int):
     with get_db() as db:
         db.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
+    return RedirectResponse(url="/accounts", status_code=303)
+
+
+# ── API: Bluesky Accounts ───────────────────────────────────────────────────
+
+@app.post("/api/bluesky-accounts")
+async def add_bluesky_account(
+    request: Request,
+    name: str = Form(...),
+    handle: str = Form(...),
+    app_password: str = Form(...),
+):
+    """Resolve the handle, verify the app password, and store the account."""
+    try:
+        handle = bluesky_normalize_handle(handle)
+    except ValueError as e:
+        return _render_accounts_error(request, str(e))
+
+    try:
+        did, pds = bluesky_resolve_pds(handle)
+        session = bluesky_create_session(pds, handle, app_password)
+    except BlueskyAuthError:
+        return _render_accounts_error(
+            request,
+            "Bluesky rejected the app password. Check the handle and app password and try again.",
+        )
+    except BlueskyError as e:
+        return _render_accounts_error(request, str(e))
+    except Exception:
+        logger.exception("Bluesky account verification failed for %s", handle)
+        return _render_accounts_error(
+            request, "Could not verify the Bluesky account. Try again."
+        )
+
+    display_name = name.strip() or handle
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO bluesky_accounts (
+                name, handle, app_password, did, pds,
+                access_jwt, refresh_jwt, session_expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(handle) DO UPDATE SET
+                name = excluded.name,
+                app_password = excluded.app_password,
+                did = excluded.did,
+                pds = excluded.pds,
+                access_jwt = excluded.access_jwt,
+                refresh_jwt = excluded.refresh_jwt,
+                session_expires_at = excluded.session_expires_at
+            """,
+            (
+                display_name,
+                handle,
+                app_password,
+                session["did"],
+                pds,
+                session["access_jwt"],
+                session["refresh_jwt"],
+                bluesky_session_expiry(session["access_jwt"]),
+            ),
+        )
+    return RedirectResponse(url="/accounts?status=bluesky_connected", status_code=303)
+
+
+@app.post("/api/bluesky-accounts/{account_id}/test")
+async def test_bluesky_account(account_id: int):
+    with get_db() as db:
+        account = db.execute(
+            "SELECT * FROM bluesky_accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+    if not account:
+        raise HTTPException(status_code=404, detail="Bluesky account not found")
+    success, message = test_bluesky_connection(
+        account["handle"], account["app_password"]
+    )
+    return {"success": success, "message": message}
+
+
+@app.post("/api/bluesky-accounts/{account_id}/delete")
+async def delete_bluesky_account(account_id: int):
+    with get_db() as db:
+        db.execute("DELETE FROM bluesky_accounts WHERE id = ?", (account_id,))
     return RedirectResponse(url="/accounts", status_code=303)
 
 
@@ -639,7 +777,7 @@ async def give_up_post(posted_id: int):
 # ── API: Echoes ─────────────────────────────────────────────────────────────
 
 VALID_VISIBILITY = {"public", "unlisted", "private", "direct"}
-VALID_DEST_TYPES = {"mastodon", "email"}
+VALID_DEST_TYPES = {"mastodon", "email", "bluesky"}
 VALID_FILTER_MODES = {"exclude", "include"}
 
 
@@ -649,6 +787,7 @@ async def add_echo(
     destination_type: str = Form("mastodon"),
     account_id: int = Form(None),
     email_account_id: int = Form(None),
+    bluesky_account_id: int = Form(None),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
     filter_keywords: str = Form(""),
@@ -675,10 +814,14 @@ async def add_echo(
         destination_id = account_id
         if not destination_id:
             raise HTTPException(status_code=400, detail="account_id required for mastodon destination")
-    else:
+    elif destination_type == "email":
         destination_id = email_account_id
         if not destination_id:
             raise HTTPException(status_code=400, detail="email_account_id required for email destination")
+    else:
+        destination_id = bluesky_account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="bluesky_account_id required for bluesky destination")
 
     is_enabled = 1 if enabled else 0
     is_attach_image = 1 if attach_image else 0
@@ -713,6 +856,7 @@ async def edit_echo(
     destination_type: str = Form("mastodon"),
     account_id: int = Form(None),
     email_account_id: int = Form(None),
+    bluesky_account_id: int = Form(None),
     template: str = Form("{{ title }} {{ link }}"),
     visibility: str = Form("public"),
     filter_keywords: str = Form(""),
@@ -737,10 +881,14 @@ async def edit_echo(
         destination_id = account_id
         if not destination_id:
             raise HTTPException(status_code=400, detail="account_id required for mastodon destination")
-    else:
+    elif destination_type == "email":
         destination_id = email_account_id
         if not destination_id:
             raise HTTPException(status_code=400, detail="email_account_id required for email destination")
+    else:
+        destination_id = bluesky_account_id
+        if not destination_id:
+            raise HTTPException(status_code=400, detail="bluesky_account_id required for bluesky destination")
 
     is_enabled = 1 if enabled else 0
     is_attach_image = 1 if attach_image else 0
@@ -812,14 +960,9 @@ async def oauth_connect(request: Request, instance: str = ""):
         auth_url = get_authorize_url(instance, oauth_session)
     except Exception:
         logger.exception("OAuth connect failed for %s", instance)
-        mastodon_accounts, email_accounts = _get_all_accounts()
-        return render(
-            "accounts.html",
+        return _render_accounts_error(
             request,
-            mastodon_accounts=mastodon_accounts,
-            email_accounts=email_accounts,
-            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-            error="Failed to start OAuth authorization. Verify the instance URL and try again.",
+            "Failed to start OAuth authorization. Verify the instance URL and try again.",
         )
 
     response = RedirectResponse(url=auth_url, status_code=302)
@@ -844,14 +987,8 @@ async def oauth_callback(
 ):
     """Handle a one-time, session-bound Mastodon OAuth callback."""
     if error:
-        mastodon_accounts, email_accounts = _get_all_accounts()
-        return render(
-            "accounts.html",
-            request,
-            mastodon_accounts=mastodon_accounts,
-            email_accounts=email_accounts,
-            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-            error="Authorization was denied by the OAuth provider.",
+        return _render_accounts_error(
+            request, "Authorization was denied by the OAuth provider."
         )
 
     if not code or not state:
@@ -876,14 +1013,8 @@ async def oauth_callback(
         token_data = exchange_code(instance, code)
     except Exception:
         logger.exception("OAuth token exchange failed for %s", instance)
-        mastodon_accounts, email_accounts = _get_all_accounts()
-        response = render(
-            "accounts.html",
-            request,
-            mastodon_accounts=mastodon_accounts,
-            email_accounts=email_accounts,
-            smtp_configured=bool(_get_smtp_settings().get("smtp_host")),
-            error="OAuth token exchange failed. Please try connecting again.",
+        response = _render_accounts_error(
+            request, "OAuth token exchange failed. Please try connecting again."
         )
         response.delete_cookie(OAUTH_SESSION_COOKIE, path="/oauth")
         return response

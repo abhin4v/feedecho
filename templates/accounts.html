@@ -15,6 +15,10 @@
 <div class="alert alert-success">Email address added.</div>
 {% endif %}
 
+{% if request.query_params.get('status') == 'bluesky_connected' %}
+<div class="alert alert-success">Bluesky account connected successfully.</div>
+{% endif %}
+
 <section class="oauth-section">
     <h2>Connect Mastodon via OAuth</h2>
     <p class="hint">Enter your Mastodon instance to connect with a single click.</p>
@@ -44,6 +48,17 @@
         <input type="text" name="name" placeholder="Name" required>
         <input type="email" name="email" placeholder="user@example.com" required>
         <button type="submit">Add Email Address</button>
+    </form>
+</section>
+
+<section>
+    <h2>Connect Bluesky</h2>
+    <p class="hint">Create an <strong>App Password</strong> in Bluesky (Settings → Privacy &amp; Security → App Passwords) and enter it here. The app password is stored only in FeedEcho's local database and can only be used to create posts.</p>
+    <form method="post" action="/api/bluesky-accounts" class="inline-form">
+        <input type="text" name="name" placeholder="Display name">
+        <input type="text" name="handle" placeholder="username.bsky.social" required>
+        <input type="password" name="app_password" placeholder="App password (xxxx-xxxx-xxxx-xxxx)" required>
+        <button type="submit">Connect Account</button>
     </form>
 </section>
 
@@ -110,7 +125,38 @@
 </div>
 {% endif %}
 
-{% if not mastodon_accounts and not email_accounts %}
-<p class="empty-state">No accounts yet. Connect a Mastodon instance or add an email address above.</p>
+{% if bluesky_accounts %}
+<h2>Bluesky Accounts</h2>
+<div class="data-table-wrapper">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Handle</th>
+            <th>Name</th>
+            <th>Added</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for account in bluesky_accounts %}
+        <tr>
+            <td data-label="Handle"><code>@{{ account.handle }}</code></td>
+            <td data-label="Name">{{ account.name }}</td>
+            <td data-label="Added"><small>{{ account.created_at }}</small></td>
+            <td data-label="Actions" class="action-cell">
+                <button class="btn-sm" onclick="testBlueskyAccount({{ account.id }})">Test</button>
+                <form method="post" action="/api/bluesky-accounts/{{ account.id }}/delete" class="inline">
+                    <button type="submit" class="btn-sm btn-danger" onclick="return confirm('Delete this account?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</div>
+{% endif %}
+
+{% if not mastodon_accounts and not email_accounts and not bluesky_accounts %}
+<p class="empty-state">No accounts yet. Connect a Mastodon instance, Bluesky account, or add an email address above.</p>
 {% endif %}
 {% endblock %}
