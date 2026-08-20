@@ -198,6 +198,7 @@ def init_db() -> None:
         """)
         _add_column_if_missing(db, "posted_items", "claimed_at", "TIMESTAMP")
         _add_column_if_missing(db, "posted_items", "claim_token", "TEXT")
+        _add_column_if_missing(db, "posted_items", "post_url", "TEXT")
         _add_column_if_missing(
             db,
             "posted_items",

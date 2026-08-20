@@ -19,6 +19,10 @@
 <div class="alert alert-success">Bluesky account connected successfully.</div>
 {% endif %}
 
+{% if request.query_params.get('status') == 'bluesky_deleted' %}
+<div class="alert alert-success">Bluesky account deleted.</div>
+{% endif %}
+
 <section class="oauth-section">
     <h2>Connect Mastodon via OAuth</h2>
     <p class="hint">Enter your Mastodon instance to connect with a single click.</p>
@@ -53,7 +57,7 @@
 
 <section>
     <h2>Connect Bluesky</h2>
-    <p class="hint">Create an <strong>App Password</strong> in Bluesky (Settings → Privacy &amp; Security → App Passwords) and enter it here. The app password is stored only in FeedEcho's local database and can only be used to create posts.</p>
+    <p class="hint">Create an <strong>App Password</strong> in Bluesky (Settings → Privacy &amp; Security → App Passwords) and enter it here. It is stored only in FeedEcho's local database. App passwords can post on your behalf but cannot change account settings or log in to the Bluesky app.</p>
     <form method="post" action="/api/bluesky-accounts" class="inline-form">
         <input type="text" name="name" placeholder="Display name">
         <input type="text" name="handle" placeholder="username.bsky.social" required>

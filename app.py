@@ -455,17 +455,23 @@ async def delete_email_account(account_id: int):
 # ── API: Bluesky Accounts ───────────────────────────────────────────────────
 
 @app.post("/api/bluesky-accounts")
-async def add_bluesky_account(
+def add_bluesky_account(
     request: Request,
     name: str = Form(...),
     handle: str = Form(...),
     app_password: str = Form(...),
 ):
-    """Resolve the handle, verify the app password, and store the account."""
+    """Resolve the handle, verify the app password, and store the account.
+
+    Synchronous route (threadpool-offloaded): it performs blocking DNS,
+    HTTPS, and SQLite work that must not run on the event loop.
+    """
     try:
         handle = bluesky_normalize_handle(handle)
     except ValueError as e:
         return _render_accounts_error(request, str(e))
+
+    display_name = name.strip()[:100] or handle
 
     try:
         did, pds = bluesky_resolve_pds(handle)
@@ -483,7 +489,6 @@ async def add_bluesky_account(
             request, "Could not verify the Bluesky account. Try again."
         )
 
-    display_name = name.strip() or handle
     with get_db() as db:
         db.execute(
             """
@@ -516,7 +521,7 @@ async def add_bluesky_account(
 
 
 @app.post("/api/bluesky-accounts/{account_id}/test")
-async def test_bluesky_account(account_id: int):
+def test_bluesky_account(account_id: int):
     with get_db() as db:
         account = db.execute(
             "SELECT * FROM bluesky_accounts WHERE id = ?", (account_id,)
@@ -530,10 +535,23 @@ async def test_bluesky_account(account_id: int):
 
 
 @app.post("/api/bluesky-accounts/{account_id}/delete")
-async def delete_bluesky_account(account_id: int):
+def delete_bluesky_account(request: Request, account_id: int):
+    with get_db() as db:
+        dependent = db.execute(
+            """
+            SELECT COUNT(*) as c FROM echoes
+             WHERE destination_type = 'bluesky' AND destination_id = ?
+            """,
+            (account_id,),
+        ).fetchone()["c"]
+    if dependent:
+        return _render_accounts_error(
+            request,
+            "This Bluesky account is used by echoes. Delete or reassign those echoes first.",
+        )
     with get_db() as db:
         db.execute("DELETE FROM bluesky_accounts WHERE id = ?", (account_id,))
-    return RedirectResponse(url="/accounts", status_code=303)
+    return RedirectResponse(url="/accounts?status=bluesky_deleted", status_code=303)
 
 
 # ── API: Settings ───────────────────────────────────────────────────────────

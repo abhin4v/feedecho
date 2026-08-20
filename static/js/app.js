@@ -7,6 +7,10 @@ async function testAccount(accountId) {
     try {
         const resp = await fetch(`/api/accounts/${accountId}/test`, { method: 'POST' });
         const data = await resp.json();
+        if (!resp.ok) {
+            alert('Test failed: ' + (data.detail || resp.statusText));
+            return;
+        }
         alert(data.message || (data.success ? 'OK' : 'Failed'));
     } catch (e) {
         alert('Request failed: ' + e.message);
@@ -17,6 +21,10 @@ async function testBlueskyAccount(accountId) {
     try {
         const resp = await fetch(`/api/bluesky-accounts/${accountId}/test`, { method: 'POST' });
         const data = await resp.json();
+        if (!resp.ok) {
+            alert('Test failed: ' + (data.detail || resp.statusText));
+            return;
+        }
         alert(data.message || (data.success ? 'OK' : 'Failed'));
     } catch (e) {
         alert('Request failed: ' + e.message);

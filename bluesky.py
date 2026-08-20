@@ -2,8 +2,9 @@
 
 FeedEcho connects to Bluesky using app passwords (the standard method for
 bots and automation). App passwords are created in the Bluesky app under
-Settings > Privacy & Security > App Passwords, and can only create posts —
-they cannot change account settings or be used to log in to the app.
+Settings > Privacy & Security > App Passwords. They are scoped to app-level
+actions (posting among them) and cannot change account settings or be used
+to log in to the app.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from feed_parser import validate_outbound_url
 PUBLIC_API = "https://public.api.bsky.app"
 PLC_DIRECTORY = "https://plc.directory"
 POST_COLLECTION = "app.bsky.feed.post"
+POST_RECORD_TYPE = "app.bsky.feed.post"
 
 MAX_POST_GRAPHEMES = 300
 MAX_ALT_GRAPHEMES = 1000
@@ -41,22 +43,50 @@ class BlueskyAuthError(BlueskyError):
     """Credentials rejected, session expired, or app password revoked."""
 
 
+def _error_detail(response) -> str:
+    """Extract the PDS-provided error message from a JSON error body."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("error")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()[:200]
+    return ""
+
+
+def _is_token_error(detail: str) -> bool:
+    """Detect expired/revoked-token responses regardless of status code.
+
+    bsky.social historically returns ExpiredToken as a 400; treat both
+    explicit 401s and ExpiredToken/InvalidToken bodies as auth failures.
+    """
+    return "ExpiredToken" in detail or "InvalidToken" in detail
+
+
 # ── Handle normalization ─────────────────────────────────────────────────────
+
+
+_HANDLE_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+)
+_HANDLE_MAX_LEN = 253
 
 
 def normalize_handle(raw: str) -> str:
     """Normalize user-entered handles to lowercase bare form.
 
     Accepts "Name", "@Name.Bsky.Social", and "https://bsky.app/profile/x"
-    style inputs (the host part is taken from URLs). Raises ValueError when
-    nothing handle-like remains.
+    style inputs (the host part is taken from URLs). Enforces the AT Protocol
+    handle grammar and length limit. Raises ValueError on invalid input.
     """
     value = (raw or "").strip().lower().removeprefix("@")
     value = re.sub(r"^https?://", "", value)
     # Take the last path segment if given a profile URL.
     value = value.split("/")[-1].strip()
     value = value.rstrip(".").strip()
-    if not value or "." not in value or " " in value:
+    if not value or len(value) > _HANDLE_MAX_LEN or not _HANDLE_RE.match(value):
         raise ValueError("Enter a valid Bluesky handle, e.g. username.bsky.social")
     return value
 
@@ -93,7 +123,19 @@ def resolve_pds(handle: str) -> tuple[str, str]:
 
     if did.startswith("did:web:"):
         # did:web:example.com -> https://example.com/.well-known/did.json
-        pds = f"https://{did.removeprefix('did:web:')}"
+        doc_url = f"https://{did.removeprefix('did:web:')}/.well-known/did.json"
+        # The doc host is derived from remote identity data — SSRF-validate it
+        # before fetching, like every other outbound hop.
+        validate_outbound_url(doc_url)
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(15.0), follow_redirects=False
+            ) as client:
+                response = client.get(doc_url)
+                response.raise_for_status()
+                doc = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise BlueskyError(f"Could not fetch DID document for '{handle}'") from exc
     else:
         # did:plc:... -> query the PLC directory for the PDS service endpoint.
         try:
@@ -106,13 +148,14 @@ def resolve_pds(handle: str) -> tuple[str, str]:
         except (httpx.HTTPError, ValueError) as exc:
             raise BlueskyError(f"Could not fetch DID document for '{handle}'") from exc
 
-        pds = ""
-        for service in doc.get("service") or []:
-            if service.get("id") == "#atproto_pds" and service.get("serviceEndpoint"):
-                pds = service["serviceEndpoint"]
-                break
-        if not pds:
-            raise BlueskyError(f"No PDS endpoint found for '{handle}'")
+    pds = ""
+    for service in doc.get("service") or []:
+        endpoint = service.get("serviceEndpoint")
+        if service.get("id") == "#atproto_pds" and isinstance(endpoint, str) and endpoint:
+            pds = endpoint
+            break
+    if not pds:
+        raise BlueskyError(f"No PDS endpoint found for '{handle}'")
 
     pds = pds.rstrip("/")
     # The PDS hostname came from a remote identity document — validate it
@@ -156,9 +199,13 @@ def create_session(pds: str, handle: str, app_password: str) -> dict:
         raise BlueskyError(f"Could not reach PDS {pds}") from exc
 
     if response.status_code in (400, 401):
-        raise BlueskyAuthError("Invalid handle or app password")
+        detail = _error_detail(response)
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyAuthError(f"Invalid handle or app password{suffix}")
     if response.status_code >= 400:
-        raise BlueskyError(f"PDS returned HTTP {response.status_code}")
+        detail = _error_detail(response)
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyError(f"PDS returned HTTP {response.status_code}{suffix}")
 
     try:
         data = response.json()
@@ -190,9 +237,13 @@ def refresh_session(pds: str, refresh_jwt: str) -> dict:
         raise BlueskyError(f"Could not reach PDS {pds}") from exc
 
     if response.status_code in (400, 401):
-        raise BlueskyAuthError("Session expired; re-authenticate with app password")
+        detail = _error_detail(response)
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyAuthError(f"Session refresh rejected{suffix}")
     if response.status_code >= 400:
-        raise BlueskyError(f"PDS returned HTTP {response.status_code}")
+        detail = _error_detail(response)
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyError(f"PDS returned HTTP {response.status_code}{suffix}")
 
     try:
         data = response.json()
@@ -200,11 +251,32 @@ def refresh_session(pds: str, refresh_jwt: str) -> dict:
         raise BlueskyError("PDS returned an invalid refresh response") from exc
 
     access_jwt = data.get("accessJwt")
-    new_refresh = data.get("refreshJwt") or refresh_jwt
+    new_refresh = data.get("refreshJwt")
     did = data.get("did")
     if not isinstance(access_jwt, str) or not access_jwt or not isinstance(did, str):
         raise BlueskyError("PDS returned an incomplete refresh response")
+    if not isinstance(new_refresh, str) or not new_refresh:
+        # AT Protocol rotates refresh tokens on every refresh; a missing
+        # rotated token means the old one is dead. Do not reuse it.
+        raise BlueskyError("PDS refresh response omitted the rotated refresh token")
     return {"did": did, "access_jwt": access_jwt, "refresh_jwt": new_refresh}
+
+
+def delete_session(pds: str, refresh_jwt: str) -> None:
+    """Best-effort session cleanup (used by connection tests). Never raises."""
+    pds = pds.rstrip("/")
+    try:
+        validate_outbound_url(pds)
+        with httpx.Client(
+            timeout=httpx.Timeout(15.0), follow_redirects=False
+        ) as client:
+            client.post(
+                f"{pds}/xrpc/com.atproto.server.deleteSession",
+                headers={"Authorization": f"Bearer {refresh_jwt}"},
+            )
+    except Exception:
+        # SSRF validation failure or network error — cleanup is best-effort.
+        pass
 
 
 def session_expiry(access_jwt: str) -> str:
@@ -237,6 +309,10 @@ def build_facets(text: str) -> list[dict]:
 
     for match in _URL_RE.finditer(text):
         uri = match.group(0)
+        # If the truncation ellipsis is inside the match, the URL was cut off
+        # mid-way — drop it instead of linkifying a broken/partial URL.
+        if "…" in uri:
+            continue
         # Strip trailing punctuation that is unlikely to be part of the URL.
         while uri and uri[-1] in ".,;:!?'\"()[]{}<>":
             uri = uri[:-1]
@@ -247,6 +323,11 @@ def build_facets(text: str) -> list[dict]:
         char_start = match.start()
         byte_start = len(text[:char_start].encode("utf-8"))
         byte_end = byte_start + len(uri.encode("utf-8"))
+
+        # If the text was truncated mid-URL, the byte range won't decode back
+        # to the full URI — drop the facet instead of linkifying a broken URL.
+        if byte_end > len(encoded) or encoded[byte_start:byte_end].decode("utf-8") != uri:
+            continue
 
         facets.append(
             {
@@ -266,16 +347,33 @@ def build_facets(text: str) -> list[dict]:
 _ZWJ = "\u200d"
 _VARIATION_SELECTORS = {"\ufe0e", "\ufe0f"}
 _SKIN_TONE_RANGE = range(0x1F3FB, 0x1F400)
+_EMOJI_TAG_RANGE = range(0xE0020, 0xE0080)
+
+
+def _is_regional_indicator(ch: str) -> bool:
+    return 0x1F1E6 <= ord(ch) <= 0x1F1FF
+
+
+def _trailing_ri_count(cluster: str) -> int:
+    n = 0
+    for ch in reversed(cluster):
+        if _is_regional_indicator(ch):
+            n += 1
+        else:
+            break
+    return n
 
 
 def _grapheme_clusters(text: str) -> list[str]:
     """Split text into grapheme clusters using a conservative UAX #29 subset.
 
     A new grapheme starts at any character that is not a combining mark,
-    zero-width joiner, variation selector, or skin-tone modifier. ZWJ glues in
-    both directions (GB9 + a permissive GB11 stand-in), so ZWJ emoji sequences
-    like family emoji stay together. Over-merging is deliberate: it can only
-    under-count graphemes, so truncation never exceeds platform limits.
+    zero-width joiner, variation selector, skin-tone modifier, or emoji tag
+    character. ZWJ glues in both directions (GB9 + a permissive GB11
+    stand-in), so ZWJ emoji sequences like family emoji stay together.
+    Regional-indicator pairs (flags) merge so a flag never splits. The
+    remaining gaps over-merge, which can only under-count graphemes, so
+    truncation never exceeds platform limits.
     """
     clusters: list[str] = []
     for ch in text:
@@ -284,9 +382,18 @@ def _grapheme_clusters(text: str) -> list[str]:
             cat in ("Mn", "Mc", "Me")
             or ch in _VARIATION_SELECTORS
             or ord(ch) in _SKIN_TONE_RANGE
+            or ord(ch) in _EMOJI_TAG_RANGE
         )
         if clusters:
-            is_continuation = is_continuation or ch == _ZWJ or clusters[-1][-1] == _ZWJ
+            is_continuation = (
+                is_continuation
+                or ch == _ZWJ
+                or clusters[-1][-1] == _ZWJ
+                or (
+                    _is_regional_indicator(ch)
+                    and _trailing_ri_count(clusters[-1]) == 1
+                )
+            )
         if clusters and is_continuation:
             clusters[-1] += ch
         else:
@@ -299,7 +406,12 @@ def truncate_graphemes(text: str, max_graphemes: int = MAX_POST_GRAPHEMES) -> st
     clusters = _grapheme_clusters(text)
     if len(clusters) <= max_graphemes:
         return text
-    return "".join(clusters[: max_graphemes - 1]).rstrip() + "…"
+    head = "".join(clusters[: max_graphemes - 1]).rstrip()
+    # Don't leave a dangling ZWJ at the cut point — it renders as a broken
+    # sequence in most clients.
+    while head.endswith(_ZWJ):
+        head = head[:-1]
+    return head + "…"
 
 
 # ── Posts and images ─────────────────────────────────────────────────────────
@@ -308,9 +420,21 @@ def truncate_graphemes(text: str, max_graphemes: int = MAX_POST_GRAPHEMES) -> st
 def upload_blob(
     pds: str, access_jwt: str, image_bytes: bytes, content_type: str
 ) -> dict | None:
-    """Upload an image blob. Returns the blob reference dict, or None on failure."""
+    """Upload an image blob.
+
+    Enforces Bluesky's image constraints (type allowlist, 1 MB cap). Returns
+    the blob reference dict, or None on transport failure. Raises
+    BlueskyAuthError on expired/revoked sessions and BlueskyError on other
+    API rejections, so callers can distinguish "skip the image" from
+    "refresh the session".
+    """
     pds = pds.rstrip("/")
     validate_outbound_url(pds)
+
+    if content_type not in BLUESKY_IMAGE_TYPES:
+        raise BlueskyError(f"Unsupported image type for Bluesky: {content_type}")
+    if len(image_bytes) > MAX_BLOB_BYTES:
+        raise BlueskyError("Image exceeds the 1 MB Bluesky blob limit")
 
     try:
         with httpx.Client(
@@ -327,8 +451,13 @@ def upload_blob(
     except httpx.RequestError:
         return None
 
+    detail = _error_detail(response)
+    if response.status_code == 401 or _is_token_error(detail):
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyAuthError(f"Blob upload rejected: session expired{suffix}")
     if response.status_code >= 400:
-        return None
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyError(f"Blob upload failed (HTTP {response.status_code}){suffix}")
 
     try:
         blob = response.json().get("blob")
@@ -352,6 +481,7 @@ def create_post(
     validate_outbound_url(pds)
 
     record: dict = {
+        "$type": POST_RECORD_TYPE,
         "text": text,
         "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -374,11 +504,15 @@ def create_post(
     except httpx.RequestError as exc:
         raise BlueskyError(f"Could not reach PDS {pds}") from exc
 
-    if response.status_code in (400, 401):
-        # 400 covers ExpiredToken and other auth-class errors for this route.
-        raise BlueskyAuthError(f"Post rejected (HTTP {response.status_code})")
+    detail = _error_detail(response)
+    if response.status_code == 401 or _is_token_error(detail):
+        # 401 (or a 400 carrying ExpiredToken/InvalidToken) is a session
+        # problem. A plain 400 is a record validation error, not auth.
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyAuthError(f"Post rejected (HTTP {response.status_code}){suffix}")
     if response.status_code >= 400:
-        raise BlueskyError(f"PDS returned HTTP {response.status_code}")
+        suffix = f" ({detail})" if detail else ""
+        raise BlueskyError(f"Post rejected (HTTP {response.status_code}){suffix}")
 
     try:
         data = response.json()
@@ -407,7 +541,12 @@ def test_connection(handle: str, app_password: str) -> tuple[bool, str]:
         handle = normalize_handle(handle)
         did, pds = resolve_pds(handle)
         session = create_session(pds, handle, app_password)
-        return True, f"Connected as @{handle} ({session['did'][:20]}…)"
+        try:
+            return True, f"Connected as @{handle} ({session['did'][:20]}…)"
+        finally:
+            # Don't accumulate server-side sessions from repeated tests —
+            # bsky.social rate-limits createSession aggressively.
+            delete_session(pds, session["refresh_jwt"])
     except ValueError as e:
         return False, str(e)
     except BlueskyAuthError:

@@ -29,6 +29,9 @@
                 {% else %}
                 {{ post.item_title[:60] }}{% if post.item_title|length > 60 %}…{% endif %}
                 {% endif %}
+                {% if post.post_url %}
+                <br><small><a href="{{ post.post_url }}" target="_blank" rel="noopener">view post ↗</a></small>
+                {% endif %}
             </td>
             <td data-label="Status">
                 {% if post.status == 'success' %}

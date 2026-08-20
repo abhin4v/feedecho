@@ -505,6 +505,7 @@ def _update_post(
     claim_token: str,
     status: str,
     error: str | None = None,
+    post_url: str | None = None,
 ) -> bool:
     """Finalize only the pending row still owned by this claim token."""
     with get_db() as db:
@@ -513,6 +514,7 @@ def _update_post(
             UPDATE posted_items
                SET status = ?,
                    error_message = ?,
+                   post_url = COALESCE(?, post_url),
                    claimed_at = NULL,
                    claim_token = NULL,
                    posted_at = CURRENT_TIMESTAMP
@@ -520,7 +522,7 @@ def _update_post(
                AND status = 'pending'
                AND claim_token = ?
             """,
-            (status, error, posted_id, claim_token),
+            (status, error, post_url, posted_id, claim_token),
         )
         return result.rowcount == 1
 
@@ -530,12 +532,15 @@ def _fail_post(
     claim_token: str,
     echo_id: int,
     error: str,
+    permanent: bool = False,
 ) -> bool:
     """Mark a claimed row failed, scheduling the next automatic retry.
 
     If the row has exhausted retry_max_attempts, it is marked 'gave_up'
-    (terminal) instead, which unblocks the feed cursor. Returns the final
-    status written.
+    (terminal) instead, which unblocks the feed cursor. Passing
+    ``permanent=True`` skips straight to 'gave_up' for failures that no
+    number of retries can fix (missing account, rejected credentials).
+    Returns the final status written.
     """
     cap = max_attempts()
 
@@ -545,9 +550,12 @@ def _fail_post(
         ).fetchone()
     attempts = row["attempt_count"] if row else 1
 
-    if cap > 0 and attempts >= cap:
+    if permanent or (cap > 0 and attempts >= cap):
         final = "gave_up"
-        error_out = f"Gave up after {attempts} attempts. Last error: {error}"
+        if permanent:
+            error_out = error
+        else:
+            error_out = f"Gave up after {attempts} attempts. Last error: {error}"
         retry_at = None
     else:
         final = "failed"
@@ -732,29 +740,39 @@ def _send_email_echo(
     return ok
 
 
-def _bsky_session(db, account) -> dict:
+def _bsky_session(account) -> dict:
     """Return a usable Bluesky session, caching JWTs in the account row.
 
     Resolves the account's PDS when unknown, reuses a cached access JWT while
     unexpired, refreshes via the refresh JWT when possible, and falls back to
-    a fresh app-password login otherwise.
+    a fresh app-password login otherwise. All network I/O happens with no DB
+    connection held; only the short cache write opens one.
     """
     handle = account["handle"]
     app_password = account["app_password"]
     pds = (account["pds"] or "").strip()
+    did = (account["did"] or "").strip()
     access_jwt = (account["access_jwt"] or "").strip()
     refresh_jwt = (account["refresh_jwt"] or "").strip()
     now = _now()
 
+    resolved_did = None
     if not pds:
-        did, pds = resolve_pds(handle)
+        resolved_did, pds = resolve_pds(handle)
 
     if access_jwt:
         expires_at = account["session_expires_at"] or ""
         if expires_at and expires_at > now:
+            # Persist a late PDS/DID resolution without disturbing the session.
+            if resolved_did:
+                with get_db() as db:
+                    db.execute(
+                        "UPDATE bluesky_accounts SET did = ?, pds = ? WHERE id = ?",
+                        (resolved_did, pds, account["id"]),
+                    )
             return {
                 "pds": pds,
-                "did": (account["did"] or "").strip(),
+                "did": did or resolved_did or "",
                 "access_jwt": access_jwt,
             }
 
@@ -768,22 +786,23 @@ def _bsky_session(db, account) -> dict:
     if session is None:
         session = create_session(pds, handle, app_password)
 
-    db.execute(
-        """
-        UPDATE bluesky_accounts
-           SET did = ?, pds = ?, access_jwt = ?, refresh_jwt = ?,
-               session_expires_at = ?
-         WHERE id = ?
-        """,
-        (
-            session["did"],
-            pds,
-            session["access_jwt"],
-            session["refresh_jwt"],
-            session_expiry(session["access_jwt"]),
-            account["id"],
-        ),
-    )
+    with get_db() as db:
+        db.execute(
+            """
+            UPDATE bluesky_accounts
+               SET did = ?, pds = ?, access_jwt = ?, refresh_jwt = ?,
+                   session_expires_at = ?
+             WHERE id = ?
+            """,
+            (
+                session["did"],
+                pds,
+                session["access_jwt"],
+                session["refresh_jwt"],
+                session_expiry(session["access_jwt"]),
+                account["id"],
+            ),
+        )
     return {
         "pds": pds,
         "did": session["did"],
@@ -807,20 +826,32 @@ def _send_bluesky(
 
     if not account:
         return _fail_post(
-            posted_id, claim_token, echo["id"], f"Bluesky account {account_id} not found"
+            posted_id,
+            claim_token,
+            echo["id"],
+            f"Bluesky account {account_id} not found",
+            permanent=True,
         )
 
-    text = truncate_graphemes(content, BLUESKY_MAX_GRAPHEMES)
-    facets = build_facets(text)
+    # Content preparation is pure string work, but a bug here must not strand
+    # the claimed row — finalize it as failed so the bounded retry owns it.
+    try:
+        text = truncate_graphemes(content or "", BLUESKY_MAX_GRAPHEMES)
+        facets = build_facets(text)
+    except Exception:
+        logger.exception("Echo %s: Bluesky content preparation failed", echo["id"])
+        return _fail_post(
+            posted_id, claim_token, echo["id"], "Content preparation failed"
+        )
 
     try:
-        with get_db() as db:
-            session = _bsky_session(db, account)
+        session = _bsky_session(account)
     except Exception:
         logger.exception("Echo %s: Bluesky session failed", echo["id"])
         return _fail_post(posted_id, claim_token, echo["id"], "Bluesky session failed")
 
     # Image attachment: optional, single image, with AI alt text when enabled.
+    # Any failure in the pipeline degrades to a text-only post.
     try:
         attach_image = bool(echo["attach_image"])
     except (KeyError, IndexError):
@@ -828,77 +859,120 @@ def _send_bluesky(
 
     image_blob = None
     alt_description = ""
-    if attach_image:
-        image_url = item.get("image_url", "")
-        if image_url:
-            image_result = fetch_image(image_url)
-            if image_result:
-                img_bytes, img_type = image_result
-                if img_type in BLUESKY_IMAGE_TYPES and len(img_bytes) <= MAX_BLOB_BYTES:
-                    if alt_text.is_enabled():
-                        try:
-                            alt_description = (
-                                alt_text.generate_alt_text(img_bytes, img_type) or ""
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Echo %s: alt text generation failed for item %s",
+    try:
+        if attach_image:
+            image_url = item.get("image_url", "")
+            if image_url:
+                image_result = fetch_image(image_url)
+                if image_result:
+                    img_bytes, img_type = image_result
+                    if img_type in BLUESKY_IMAGE_TYPES and len(img_bytes) <= MAX_BLOB_BYTES:
+                        if alt_text.is_enabled():
+                            try:
+                                alt_description = (
+                                    alt_text.generate_alt_text(img_bytes, img_type) or ""
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Echo %s: alt text generation failed for item %s",
+                                    echo["id"],
+                                    item["id"],
+                                    exc_info=True,
+                                )
+                        blob = upload_blob(
+                            pds=session["pds"],
+                            access_jwt=session["access_jwt"],
+                            image_bytes=img_bytes,
+                            content_type=img_type,
+                        )
+                        if blob:
+                            image_blob = blob
+                            logger.info(
+                                "Echo %s: uploaded Bluesky image blob for item %s",
                                 echo["id"],
                                 item["id"],
-                                exc_info=True,
                             )
-                    blob = upload_blob(
-                        pds=session["pds"],
-                        access_jwt=session["access_jwt"],
-                        image_bytes=img_bytes,
-                        content_type=img_type,
-                    )
-                    if blob:
-                        image_blob = blob
-                        logger.info(
-                            "Echo %s: uploaded Bluesky image blob for item %s",
-                            echo["id"],
-                            item["id"],
-                        )
+                        else:
+                            logger.warning(
+                                "Echo %s: Bluesky image upload failed for item %s, posting text-only",
+                                echo["id"],
+                                item["id"],
+                            )
                     else:
-                        logger.warning(
-                            "Echo %s: Bluesky image upload failed for item %s, posting text-only",
+                        logger.info(
+                            "Echo %s: image unsupported for Bluesky (type=%s, size=%d), posting text-only",
                             echo["id"],
-                            item["id"],
+                            img_type,
+                            len(img_bytes),
                         )
                 else:
                     logger.info(
-                        "Echo %s: image unsupported for Bluesky (type=%s, size=%d), posting text-only",
+                        "Echo %s: image fetch failed for item %s, posting text-only",
                         echo["id"],
-                        img_type,
-                        len(img_bytes),
+                        item["id"],
                     )
-            else:
-                logger.info(
-                    "Echo %s: image fetch failed for item %s, posting text-only",
-                    echo["id"],
-                    item["id"],
-                )
+    except Exception:
+        logger.warning(
+            "Echo %s: Bluesky image pipeline failed for item %s, posting text-only",
+            echo["id"],
+            item["id"],
+            exc_info=True,
+        )
+        image_blob = None
+        alt_description = ""
 
     embed = build_image_embed(image_blob, alt_description) if image_blob else None
 
-    try:
-        create_post(
+    # Re-validate claim ownership immediately before the post: if the lease
+    # lapsed and another worker reclaimed this row, posting would duplicate.
+    with get_db() as db:
+        owned = db.execute(
+            """
+            SELECT 1 FROM posted_items
+             WHERE id = ? AND status = 'pending' AND claim_token = ?
+            """,
+            (posted_id, claim_token),
+        ).fetchone()
+    if not owned:
+        logger.warning(
+            "Echo %s: claim lost before Bluesky dispatch; skipping item %s",
+            echo["id"],
+            item["id"],
+        )
+        return False
+
+    def _do_post(access_jwt: str, repo: str) -> dict:
+        return create_post(
             pds=session["pds"],
-            access_jwt=session["access_jwt"],
-            repo=session["did"],
+            access_jwt=access_jwt,
+            repo=repo,
             text=text,
             facets=facets or None,
             embed=embed,
         )
+
+    try:
+        result = _do_post(session["access_jwt"], session["did"])
     except BlueskyAuthError:
         # Token was rejected (expired or revoked mid-flight). Re-authenticate
         # once with the app password and retry the same payload.
+        logger.warning(
+            "Echo %s: Bluesky auth rejected for account %s, re-authenticating",
+            echo["id"],
+            account["handle"],
+        )
         try:
             with get_db() as db:
-                refreshed = create_session(
-                    session["pds"], account["handle"], account["app_password"]
-                )
+                fresh = db.execute(
+                    "SELECT handle, app_password FROM bluesky_accounts WHERE id = ?",
+                    (account["id"],),
+                ).fetchone()
+            if not fresh:
+                raise BlueskyError("Bluesky account was deleted during dispatch")
+            refreshed = create_session(
+                session["pds"], fresh["handle"], fresh["app_password"]
+            )
+            with get_db() as db:
                 db.execute(
                     """
                     UPDATE bluesky_accounts
@@ -914,16 +988,22 @@ def _send_bluesky(
                         account["id"],
                     ),
                 )
-            create_post(
-                pds=session["pds"],
-                access_jwt=refreshed["access_jwt"],
-                repo=refreshed["did"],
-                text=text,
-                facets=facets or None,
-                embed=embed,
+            result = _do_post(refreshed["access_jwt"], refreshed["did"])
+        except BlueskyAuthError:
+            # Credentials themselves are bad/revoked — retries cannot help.
+            logger.error(
+                "Echo %s: Bluesky credentials rejected after re-auth; giving up",
+                echo["id"],
+            )
+            return _fail_post(
+                posted_id,
+                claim_token,
+                echo["id"],
+                "Bluesky credentials rejected",
+                permanent=True,
             )
         except Exception:
-            logger.exception("Echo %s: Bluesky post failed", echo["id"])
+            logger.exception("Echo %s: Bluesky post failed after re-auth", echo["id"])
             return _fail_post(
                 posted_id, claim_token, echo["id"], "Bluesky delivery failed"
             )
@@ -931,7 +1011,14 @@ def _send_bluesky(
         logger.exception("Echo %s: Bluesky post failed", echo["id"])
         return _fail_post(posted_id, claim_token, echo["id"], "Bluesky delivery failed")
 
-    ok = _update_post(posted_id, claim_token, "success")
+    # Persist the post URL for auditing/duplicate detection.
+    post_url = ""
+    uri = result.get("uri", "")
+    if uri:
+        rkey = uri.rsplit("/", 1)[-1]
+        post_url = f"https://bsky.app/profile/{session['did']}/post/{rkey}"
+
+    ok = _update_post(posted_id, claim_token, "success", post_url=post_url)
     if ok:
         record_success(echo["id"])
     return ok
